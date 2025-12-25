@@ -1,0 +1,9 @@
+/.venv
+/RANDOM_COLOR_IMPLEMENTATION.md
+/__pycache__
+/test_audio.py
+/test_canvas.py
+/test_init.py
+/test_minimal.py
+/test_palette.py
+/venv
