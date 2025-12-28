@@ -263,7 +263,7 @@ class AudioVisualizer(QMainWindow):
                 if ('stereo mix' in name_lower or 
                     'wave out' in name_lower or 
                     'loopback' in name_lower or
-                    ('speakers' in name_lower and dev_info['maxInputChannels'] > 0)):
+                    ('what u hear' in name_lower and dev_info['maxInputChannels'] > 0)):
                     wasapi_info = dev_info
                     loopback_device_index = i
                     if not self.SILENT:
@@ -279,19 +279,69 @@ class AudioVisualizer(QMainWindow):
                     print("  3. Enable 'Stereo Mix' or 'Wave Out Mix'")
                 return
             
-            # Open stream with WASAPI loopback
-            if not self.SILENT:
-                print(f"Opening audio stream: {self.RATE}Hz, {self.CHANNELS} channels, chunk={self.CHUNK}")
+            # Get device capabilities
+            device_info = p.get_device_info_by_index(loopback_device_index)
             
-            stream = p.open(
-                format=pyaudio.paInt16,
-                channels=self.CHANNELS,
-                rate=self.RATE,
-                input=True,
-                input_device_index=loopback_device_index,
-                frames_per_buffer=self.CHUNK,
-                stream_callback=None  # Use blocking mode for simplicity
-            )
+            # Use device's default sample rate if possible
+            default_sample_rate = int(device_info.get('defaultSampleRate', self.RATE))
+            sample_rate = default_sample_rate  # Use device's native rate
+            
+            # Adjust chunk size to match device capabilities
+            # WASAPI works best with specific buffer sizes
+            chunk_size = self.CHUNK
+            
+            if not self.SILENT:
+                print(f"Opening audio stream: {sample_rate}Hz, {self.CHANNELS} channels, chunk={chunk_size}")
+                if self.DEBUG:
+                    print(f"Device default rate: {default_sample_rate}Hz")
+                    print(f"Device default channels: {device_info.get('maxInputChannels')}")
+            
+            # Try to open stream with WASAPI-compatible settings
+            try:
+                stream = p.open(
+                    format=pyaudio.paInt16,
+                    channels=self.CHANNELS,
+                    rate=sample_rate,
+                    input=True,
+                    input_device_index=loopback_device_index,
+                    frames_per_buffer=chunk_size,
+                    stream_callback=None  # Use blocking mode for simplicity
+                )
+            except OSError as e:
+                # If native rate fails, try common rates
+                if self.DEBUG:
+                    print(f"Failed with native rate {sample_rate}Hz: {e}")
+                    print("Trying common sample rates...")
+                
+                for try_rate in [44100, 48000, 96000, 192000]:
+                    try:
+                        if not self.SILENT:
+                            print(f"Trying {try_rate}Hz...")
+                        stream = p.open(
+                            format=pyaudio.paInt16,
+                            channels=self.CHANNELS,
+                            rate=try_rate,
+                            input=True,
+                            input_device_index=loopback_device_index,
+                            frames_per_buffer=chunk_size,
+                            stream_callback=None
+                        )
+                        sample_rate = try_rate
+                        if not self.SILENT:
+                            print(f"✓ Success with {try_rate}Hz")
+                        break
+                    except OSError:
+                        continue
+                else:
+                    raise OSError("Could not find compatible sample rate for audio device")
+            
+            # Update RATE if we had to use a different one
+            if sample_rate != self.RATE:
+                if not self.SILENT:
+                    print(f"Note: Using {sample_rate}Hz instead of requested {self.RATE}Hz")
+                self.RATE = sample_rate
+                # Recalculate frequency bins
+                self.freqs = np.fft.rfftfreq(self.FFT_SIZE, 1.0 / self.RATE)
             
             if not self.SILENT:
                 print("✓ Audio capture started (Windows WASAPI)")
@@ -301,7 +351,7 @@ class AudioVisualizer(QMainWindow):
             while self.running:
                 try:
                     # Read audio chunk
-                    data = stream.read(self.CHUNK, exception_on_overflow=False)
+                    data = stream.read(chunk_size, exception_on_overflow=False)
                     read_count += 1
                     
                     # Put data in queue (drop old data if queue is full)
