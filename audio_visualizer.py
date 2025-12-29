@@ -245,6 +245,18 @@ class AudioVisualizer(QMainWindow):
         try:
             p = pyaudio.PyAudio()
             
+            # Find WASAPI host API
+            wasapi_host_api = None
+            for i in range(p.get_host_api_count()):
+                api_info = p.get_host_api_info_by_index(i)
+                if self.DEBUG:
+                    print(f"Host API {i}: {api_info['name']}")
+                if 'WASAPI' in api_info['name']:
+                    wasapi_host_api = i
+                    if self.DEBUG:
+                        print(f"✓ Found WASAPI host API: index {i}")
+                    break
+            
             # Find WASAPI loopback device (stereo mix / what you hear)
             wasapi_info = None
             loopback_device_index = None
@@ -256,14 +268,16 @@ class AudioVisualizer(QMainWindow):
             for i in range(p.get_device_count()):
                 dev_info = p.get_device_info_by_index(i)
                 if self.DEBUG:
-                    print(f"Device {i}: {dev_info['name']} (channels: {dev_info['maxInputChannels']})")
+                    print(f"Device {i}: {dev_info['name']} (channels: {dev_info['maxInputChannels']}, host API: {dev_info['hostApi']})")
                 
                 # WASAPI loopback devices have specific naming patterns
                 name_lower = dev_info['name'].lower()
-                if ('stereo mix' in name_lower or 
+                has_input = dev_info['maxInputChannels'] > 0
+                
+                if has_input and ('stereo mix' in name_lower or 
                     'wave out' in name_lower or 
                     'loopback' in name_lower or
-                    ('what u hear' in name_lower and dev_info['maxInputChannels'] > 0)):
+                    'what u hear' in name_lower):
                     wasapi_info = dev_info
                     loopback_device_index = i
                     if not self.SILENT:
@@ -282,58 +296,82 @@ class AudioVisualizer(QMainWindow):
             # Get device capabilities
             device_info = p.get_device_info_by_index(loopback_device_index)
             
-            # Use device's default sample rate if possible
-            default_sample_rate = int(device_info.get('defaultSampleRate', self.RATE))
-            sample_rate = default_sample_rate  # Use device's native rate
+            # Use device's default sample rate
+            default_sample_rate = int(device_info.get('defaultSampleRate', 44100))
+            sample_rate = default_sample_rate
             
-            # Adjust chunk size to match device capabilities
-            # WASAPI works best with specific buffer sizes
-            chunk_size = self.CHUNK
+            # Get supported parameters from device
+            max_input_channels = int(device_info.get('maxInputChannels', 2))
+            channels = min(self.CHANNELS, max_input_channels)
             
             if not self.SILENT:
-                print(f"Opening audio stream: {sample_rate}Hz, {self.CHANNELS} channels, chunk={chunk_size}")
+                print(f"Device info: {default_sample_rate}Hz, {max_input_channels} channels")
                 if self.DEBUG:
-                    print(f"Device default rate: {default_sample_rate}Hz")
-                    print(f"Device default channels: {device_info.get('maxInputChannels')}")
+                    print(f"Device host API: {device_info['hostApi']}")
+                    print(f"Device default input latency: {device_info.get('defaultLowInputLatency', 0)}")
             
-            # Try to open stream with WASAPI-compatible settings
+            # Build stream parameters - use WASAPI host API if available
+            stream_params = {
+                'format': pyaudio.paInt16,
+                'channels': channels,
+                'rate': sample_rate,
+                'input': True,
+                'input_device_index': loopback_device_index,
+                'frames_per_buffer': self.CHUNK,
+            }
+            
+            # Add WASAPI-specific parameters if available
+            if wasapi_host_api is not None:
+                stream_params['input_host_api_specific_stream_info'] = None
+            
+            if not self.SILENT:
+                print(f"Opening audio stream: {sample_rate}Hz, {channels} channels, chunk={self.CHUNK}")
+            
+            # Try to open stream
+            stream = None
+            last_error = None
+            
+            # Try with current settings
             try:
-                stream = p.open(
-                    format=pyaudio.paInt16,
-                    channels=self.CHANNELS,
-                    rate=sample_rate,
-                    input=True,
-                    input_device_index=loopback_device_index,
-                    frames_per_buffer=chunk_size,
-                    stream_callback=None  # Use blocking mode for simplicity
-                )
+                stream = p.open(**stream_params)
+                if not self.SILENT:
+                    print(f"✓ Opened with {sample_rate}Hz")
             except OSError as e:
-                # If native rate fails, try common rates
+                last_error = e
                 if self.DEBUG:
-                    print(f"Failed with native rate {sample_rate}Hz: {e}")
+                    print(f"Failed with {sample_rate}Hz: {e}")
+            
+            # If failed, try common sample rates
+            if stream is None:
+                if self.DEBUG:
                     print("Trying common sample rates...")
                 
-                for try_rate in [44100, 48000, 96000, 192000]:
+                for try_rate in [44100, 48000, 96000, 192000, 22050, 16000]:
+                    if try_rate == sample_rate:
+                        continue  # Already tried
+                    
+                    stream_params['rate'] = try_rate
                     try:
-                        if not self.SILENT:
+                        if self.DEBUG:
                             print(f"Trying {try_rate}Hz...")
-                        stream = p.open(
-                            format=pyaudio.paInt16,
-                            channels=self.CHANNELS,
-                            rate=try_rate,
-                            input=True,
-                            input_device_index=loopback_device_index,
-                            frames_per_buffer=chunk_size,
-                            stream_callback=None
-                        )
+                        stream = p.open(**stream_params)
                         sample_rate = try_rate
                         if not self.SILENT:
                             print(f"✓ Success with {try_rate}Hz")
                         break
-                    except OSError:
+                    except OSError as e:
+                        last_error = e
+                        if self.DEBUG:
+                            print(f"Failed: {e}")
                         continue
-                else:
-                    raise OSError("Could not find compatible sample rate for audio device")
+            
+            if stream is None:
+                # Still failed - provide detailed error
+                raise OSError(f"Could not open audio device. Last error: {last_error}\n"
+                             f"This may be because:\n"
+                             f"  1. Stereo Mix is disabled - enable it in Sound settings\n"
+                             f"  2. Another application is using the device\n"
+                             f"  3. Try installing: pip install --upgrade pyaudio")
             
             # Update RATE if we had to use a different one
             if sample_rate != self.RATE:
@@ -343,6 +381,12 @@ class AudioVisualizer(QMainWindow):
                 # Recalculate frequency bins
                 self.freqs = np.fft.rfftfreq(self.FFT_SIZE, 1.0 / self.RATE)
             
+            # Update channels if different
+            if channels != self.CHANNELS:
+                if not self.SILENT:
+                    print(f"Note: Using {channels} channels instead of requested {self.CHANNELS}")
+                self.CHANNELS = channels
+            
             if not self.SILENT:
                 print("✓ Audio capture started (Windows WASAPI)")
             
@@ -351,7 +395,7 @@ class AudioVisualizer(QMainWindow):
             while self.running:
                 try:
                     # Read audio chunk
-                    data = stream.read(chunk_size, exception_on_overflow=False)
+                    data = stream.read(self.CHUNK, exception_on_overflow=False)
                     read_count += 1
                     
                     # Put data in queue (drop old data if queue is full)
