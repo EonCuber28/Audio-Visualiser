@@ -20,12 +20,13 @@ install_requires = [
 # Optional requirements
 extras_require = {
     'scipy': ['scipy>=1.7.0'],  # Better interpolation for bass frequencies
-    'windows': ['pyaudio>=0.2.11'] if platform.system() == 'Windows' else [],
+    'windows': ['sounddevice>=0.4.6'] if platform.system() == 'Windows' else [],
+    'windows-pyaudio': ['pyaudio>=0.2.11'] if platform.system() == 'Windows' else [],  # Alternative
 }
 
 # Add platform-specific requirements to base install
 if platform.system() == 'Windows':
-    install_requires.append('pyaudio>=0.2.11')
+    install_requires.append('sounddevice>=0.4.6')  # Preferred for Windows
 
 setup(
     name="audio-frequency-visualizer",

@@ -51,12 +51,17 @@ This will automatically install all dependencies for your platform (including Py
 **1. Install Python Dependencies**
 
 ```bash
-# Install required packages
-pip install numpy PyQt5 pyaudio
+# Install required packages (sounddevice recommended)
+pip install numpy PyQt5 sounddevice
+
+# Alternative: use PyAudio (may have compatibility issues)
+# pip install numpy PyQt5 pyaudio
 
 # Optional: scipy for better bass interpolation
 pip install scipy
 ```
+
+**Note:** `sounddevice` is recommended over `pyaudio` for Windows as it has better WASAPI support and fewer compatibility issues.
 
 **2. Enable Stereo Mix**
 

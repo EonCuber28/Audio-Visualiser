@@ -23,9 +23,18 @@ import random
 IS_WINDOWS = platform.system() == 'Windows'
 IS_LINUX = platform.system() == 'Linux'
 
-# Try to import PyAudio for Windows WASAPI loopback
-HAS_PYAUDIO = False
+# Try to import sounddevice for Windows (better WASAPI support than PyAudio)
+HAS_SOUNDDEVICE = False
 if IS_WINDOWS:
+    try:
+        import sounddevice as sd
+        HAS_SOUNDDEVICE = True
+    except ImportError:
+        pass
+
+# Fallback: Try to import PyAudio for Windows WASAPI loopback
+HAS_PYAUDIO = False
+if IS_WINDOWS and not HAS_SOUNDDEVICE:
     try:
         import pyaudio
         HAS_PYAUDIO = True
@@ -236,7 +245,128 @@ class AudioVisualizer(QMainWindow):
             self._capture_audio_linux()
     
     def _capture_audio_windows(self):
-        """Capture audio on Windows using PyAudio WASAPI loopback"""
+        """Capture audio on Windows using sounddevice or PyAudio WASAPI loopback"""
+        # Try sounddevice first (better WASAPI support)
+        if HAS_SOUNDDEVICE:
+            self._capture_audio_windows_sounddevice()
+        elif HAS_PYAUDIO:
+            self._capture_audio_windows_pyaudio()
+        else:
+            if not self.SILENT:
+                print("✗ ERROR: No audio library installed for Windows.")
+                print("Install one of these:")
+                print("  pip install sounddevice  (recommended)")
+                print("  pip install pyaudio")
+    
+    def _capture_audio_windows_sounddevice(self):
+        """Capture audio using sounddevice (preferred for Windows)"""
+        try:
+            import sounddevice as sd
+            
+            if not self.SILENT:
+                print("Using sounddevice for audio capture...")
+            
+            # List all devices to find loopback
+            devices = sd.query_devices()
+            if self.DEBUG:
+                print("\nAvailable audio devices:")
+                for i, dev in enumerate(devices):
+                    print(f"  {i}: {dev['name']} (in:{dev['max_input_channels']}, out:{dev['max_output_channels']}) @ {dev['default_samplerate']}Hz")
+            
+            # Find loopback device
+            loopback_device = None
+            loopback_index = None
+            
+            for i, dev in enumerate(devices):
+                name_lower = dev['name'].lower()
+                if dev['max_input_channels'] > 0 and (
+                    'stereo mix' in name_lower or
+                    'wave out' in name_lower or
+                    'loopback' in name_lower or
+                    'what u hear' in name_lower):
+                    loopback_device = dev
+                    loopback_index = i
+                    if not self.SILENT:
+                        print(f"✓ Found loopback device: {dev['name']}")
+                    break
+            
+            if loopback_device is None:
+                if not self.SILENT:
+                    print("✗ ERROR: No loopback device found!")
+                    print("Please enable 'Stereo Mix' in Windows Sound settings")
+                return
+            
+            # Use device's native sample rate
+            sample_rate = int(loopback_device['default_samplerate'])
+            channels = min(self.CHANNELS, loopback_device['max_input_channels'])
+            
+            if not self.SILENT:
+                print(f"Opening stream: {sample_rate}Hz, {channels} channels, chunk={self.CHUNK}")
+            
+            # Update settings if different
+            if sample_rate != self.RATE:
+                if not self.SILENT:
+                    print(f"Note: Using {sample_rate}Hz (device default)")
+                self.RATE = sample_rate
+                self.freqs = np.fft.rfftfreq(self.FFT_SIZE, 1.0 / self.RATE)
+            
+            if channels != self.CHANNELS:
+                if not self.SILENT:
+                    print(f"Note: Using {channels} channels")
+                self.CHANNELS = channels
+            
+            if not self.SILENT:
+                print("✓ Audio capture started (sounddevice)")
+            
+            read_count = 0
+            
+            # Open input stream
+            with sd.InputStream(
+                device=loopback_index,
+                channels=channels,
+                samplerate=sample_rate,
+                blocksize=self.CHUNK,
+                dtype='int16'
+            ) as stream:
+                
+                while self.running:
+                    try:
+                        # Read audio chunk
+                        data, overflowed = stream.read(self.CHUNK)
+                        
+                        # Convert to bytes for compatibility with existing code
+                        data_bytes = data.tobytes()
+                        read_count += 1
+                        
+                        # Put data in queue (drop old data if queue is full)
+                        if self.audio_queue.full():
+                            try:
+                                self.audio_queue.get_nowait()
+                            except queue.Empty:
+                                pass
+                        self.audio_queue.put(data_bytes)
+                        
+                        if self.DEBUG and read_count % 100 == 0:
+                            print(f"Audio thread: {read_count} chunks, queue: {self.audio_queue.qsize()}")
+                        
+                    except Exception as e:
+                        if self.DEBUG:
+                            print(f"Read error: {e}")
+                        time.sleep(0.001)
+                        continue
+            
+        except Exception as e:
+            if not self.SILENT:
+                print(f"Error in sounddevice audio capture: {e}")
+            if self.DEBUG:
+                import traceback
+                traceback.print_exc()
+        finally:
+            if self.DEBUG:
+                print("sounddevice audio capture thread exiting")
+    
+    def _capture_audio_windows_pyaudio(self):
+        """Capture audio on Windows using PyAudio WASAPI loopback (fallback)"""
         if not HAS_PYAUDIO:
             if not self.SILENT:
                 print("✗ ERROR: PyAudio not installed. Install with: pip install pyaudio")

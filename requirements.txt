@@ -2,6 +2,11 @@ numpy>=1.21.0
 PyQt5>=5.15.0
 scipy>=1.7.0
 
-# Windows only (for WASAPI loopback audio capture)
+# Windows audio capture (choose one)
+# sounddevice is recommended for better WASAPI support
+# Install with: pip install sounddevice
+# sounddevice>=0.4.6
+
+# Alternative: PyAudio (may have compatibility issues on some systems)
 # Install with: pip install pyaudio
 # pyaudio>=0.2.11
