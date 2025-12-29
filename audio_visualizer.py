@@ -23,18 +23,27 @@ import random
 IS_WINDOWS = platform.system() == 'Windows'
 IS_LINUX = platform.system() == 'Linux'
 
-# Try to import sounddevice for Windows (better WASAPI support than PyAudio)
-HAS_SOUNDDEVICE = False
+# Try to import soundcard for Windows (native WASAPI loopback - best option)
+HAS_SOUNDCARD = False
 if IS_WINDOWS:
+    try:
+        import soundcard as sc
+        HAS_SOUNDCARD = True
+    except ImportError:
+        pass
+
+# Fallback: Try to import sounddevice for Windows
+HAS_SOUNDDEVICE = False
+if IS_WINDOWS and not HAS_SOUNDCARD:
     try:
         import sounddevice as sd
         HAS_SOUNDDEVICE = True
     except ImportError:
         pass
 
-# Fallback: Try to import PyAudio for Windows WASAPI loopback
+# Fallback: Try to import PyAudio for Windows WASAPI loabback
 HAS_PYAUDIO = False
-if IS_WINDOWS and not HAS_SOUNDDEVICE:
+if IS_WINDOWS and not HAS_SOUNDCARD and not HAS_SOUNDDEVICE:
     try:
         import pyaudio
         HAS_PYAUDIO = True
@@ -245,9 +254,11 @@ class AudioVisualizer(QMainWindow):
             self._capture_audio_linux()
     
     def _capture_audio_windows(self):
-        """Capture audio on Windows using sounddevice or PyAudio WASAPI loopback"""
-        # Try sounddevice first (better WASAPI support)
-        if HAS_SOUNDDEVICE:
+        """Capture audio on Windows using soundcard, sounddevice, or PyAudio WASAPI loopback"""
+        # Try soundcard first (native WASAPI loopback - no Stereo Mix needed!)
+        if HAS_SOUNDCARD:
+            self._capture_audio_windows_soundcard()
+        elif HAS_SOUNDDEVICE:
             self._capture_audio_windows_sounddevice()
         elif HAS_PYAUDIO:
             self._capture_audio_windows_pyaudio()
@@ -255,8 +266,115 @@ class AudioVisualizer(QMainWindow):
             if not self.SILENT:
                 print("✗ ERROR: No audio library installed for Windows.")
                 print("Install one of these:")
-                print("  pip install sounddevice  (recommended)")
+                print("  pip install soundcard  (recommended - native WASAPI loopback)")
+                print("  pip install sounddevice")
                 print("  pip install pyaudio")
+    
+    def _capture_audio_windows_soundcard(self):
+        """Capture audio using soundcard (native WASAPI loopback - best for Windows)"""
+        try:
+            import soundcard as sc
+            
+            if not self.SILENT:
+                print("Using soundcard for audio capture (native WASAPI loopback)...")
+            
+            # Get default speaker/loopback
+            try:
+                default_speaker = sc.default_speaker()
+                loopback = sc.get_microphone(id=str(default_speaker.name), include_loopback=True)
+                
+                if not self.SILENT:
+                    print(f"✓ Capturing from: {default_speaker.name}")
+                    print(f"  Channels: {loopback.channels}")
+                    print(f"  Sample rate: {loopback.samplerate} Hz")
+                
+            except Exception as e:
+                # Fallback: try to find any loopback device
+                if self.DEBUG:
+                    print(f"Could not get default speaker loopback: {e}")
+                    print("Searching for loopback devices...")
+                
+                mics = sc.all_microphones(include_loopback=True)
+                loopback = None
+                
+                for mic in mics:
+                    if mic.isloopback:
+                        loopback = mic
+                        if not self.SILENT:
+                            print(f"✓ Found loopback device: {mic.name}")
+                        break
+                
+                if loopback is None:
+                    if not self.SILENT:
+                        print("✗ ERROR: No loopback device found!")
+                    return
+            
+            # Update settings based on device
+            if loopback.samplerate != self.RATE:
+                if not self.SILENT:
+                    print(f"Note: Using {loopback.samplerate}Hz (device default)")
+                self.RATE = int(loopback.samplerate)
+                self.freqs = np.fft.rfftfreq(self.FFT_SIZE, 1.0 / self.RATE)
+            
+            # Determine channels
+            device_channels = loopback.channels
+            if device_channels >= 2:
+                channels = 2
+            elif device_channels == 1:
+                channels = 1
+            else:
+                channels = 2
+            
+            if channels != self.CHANNELS:
+                if not self.SILENT:
+                    channel_type = "mono" if channels == 1 else "stereo"
+                    print(f"Note: Using {channels} channel{'s' if channels > 1 else ''} ({channel_type})")
+                self.CHANNELS = channels
+            
+            if not self.SILENT:
+                print("✓ Audio capture started (soundcard WASAPI loopback)")
+            
+            read_count = 0
+            
+            # Record in a loop
+            with loopback.recorder(samplerate=self.RATE, channels=channels, blocksize=self.CHUNK) as rec:
+                while self.running:
+                    try:
+                        # Read audio chunk
+                        data = rec.record(numframes=self.CHUNK)
+                        
+                        # Convert float32 data to int16 for compatibility
+                        data_int16 = (data * 32767).astype(np.int16)
+                        data_bytes = data_int16.tobytes()
+                        
+                        read_count += 1
+                        
+                        # Put data in queue (drop old data if queue is full)
+                        if self.audio_queue.full():
+                            try:
+                                self.audio_queue.get_nowait()
+                            except queue.Empty:
+                                pass
+                        self.audio_queue.put(data_bytes)
+                        
+                        if self.DEBUG and read_count % 100 == 0:
+                            print(f"Audio thread: {read_count} chunks, queue: {self.audio_queue.qsize()}")
+                    
+                    except Exception as e:
+                        if self.DEBUG:
+                            print(f"Read error: {e}")
+                        time.sleep(0.001)
+                        continue
+        
+        except Exception as e:
+            if not self.SILENT:
+                print(f"Error in soundcard audio capture: {e}")
+            if self.DEBUG:
+                import traceback
+                traceback.print_exc()
+        finally:
+            if self.DEBUG:
+                print("soundcard audio capture thread exiting")
     
     def _capture_audio_windows_sounddevice(self):
         """Capture audio using sounddevice (preferred for Windows)"""
@@ -294,24 +412,29 @@ class AudioVisualizer(QMainWindow):
                         print(f"✓ Found loopback device: {dev['name']}")
                     break
             
-            # Strategy 2: If no explicit loopback, try to use default output device with WASAPI
-            # Note: sounddevice doesn't support true WASAPI loopback, so suggest PyAudio instead
+            # Strategy 2: If no explicit loopback, suggest better options
+            # Note: sounddevice doesn't support true WASAPI loopback
             if loopback_device is None:
                 if not self.SILENT:
                     print("\n✗ No loopback device found with sounddevice!")
-                    print("\nTo capture system audio on Windows, you have 2 options:")
-                    print("\nOption 1 - Enable Stereo Mix (works with sounddevice):")
+                    print("\nTo capture system audio on Windows, you have 3 options:")
+                    print("\nOption 1 - Use soundcard (BEST - no Stereo Mix needed!):")
+                    print("  1. Uninstall sounddevice: pip uninstall sounddevice")
+                    print("  2. Install soundcard: pip install soundcard")
+                    print("  3. Run the program again")
+                    print("  → This uses native WASAPI loopback, captures directly from your speakers")
+                    print("\nOption 2 - Enable Stereo Mix (works with sounddevice):")
                     print("  1. Right-click speaker icon in taskbar → Sounds")
                     print("  2. Go to 'Recording' tab")
                     print("  3. Right-click in empty area → 'Show Disabled Devices'")
                     print("  4. Right-click 'Stereo Mix' → Enable")
                     print("  5. Set it as Default Device (optional)")
-                    print("\nOption 2 - Use PyAudio with WASAPI loopback (recommended):")
+                    print("\nOption 3 - Use PyAudio (also requires Stereo Mix):")
                     print("  1. Uninstall sounddevice: pip uninstall sounddevice")
                     print("  2. Install PyAudio: pip install pyaudio")
-                    print("  3. Run the program again")
-                    print("\nPyAudio automatically captures audio from your current output device without")
-                    print("requiring Stereo Mix to be enabled.")
+                    print("  3. Enable Stereo Mix (see Option 2)")
+                    print("  4. Run the program again")
+                    print("\n→ RECOMMENDED: Use Option 1 (soundcard) for hassle-free audio capture!")
                 return
             
             # Use device's native sample rate
