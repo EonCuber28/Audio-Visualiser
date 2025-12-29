@@ -320,40 +320,39 @@ class AudioVisualizer(QMainWindow):
             
             read_count = 0
             
-            # Open input stream
+            # Define callback function for non-blocking audio capture
+            def audio_callback(indata, frames, time_info, status):
+                nonlocal read_count
+                if status and self.DEBUG:
+                    print(f"Audio callback status: {status}")
+                
+                # Convert to bytes for compatibility with existing code
+                data_bytes = indata.tobytes()
+                read_count += 1
+                
+                # Put data in queue (drop old data if queue is full)
+                if self.audio_queue.full():
+                    try:
+                        self.audio_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                self.audio_queue.put(data_bytes)
+                
+                if self.DEBUG and read_count % 100 == 0:
+                    print(f"Audio thread: {read_count} chunks, queue: {self.audio_queue.qsize()}")
+            
+            # Open input stream with callback (non-blocking mode)
             with sd.InputStream(
                 device=loopback_index,
                 channels=channels,
                 samplerate=sample_rate,
                 blocksize=self.CHUNK,
-                dtype='int16'
+                dtype='int16',
+                callback=audio_callback
             ) as stream:
-                
+                # Keep thread alive while running
                 while self.running:
-                    try:
-                        # Read audio chunk
-                        data, overflowed = stream.read(self.CHUNK)
-                        
-                        # Convert to bytes for compatibility with existing code
-                        data_bytes = data.tobytes()
-                        read_count += 1
-                        
-                        # Put data in queue (drop old data if queue is full)
-                        if self.audio_queue.full():
-                            try:
-                                self.audio_queue.get_nowait()
-                            except queue.Empty:
-                                pass
-                        self.audio_queue.put(data_bytes)
-                        
-                        if self.DEBUG and read_count % 100 == 0:
-                            print(f"Audio thread: {read_count} chunks, queue: {self.audio_queue.qsize()}")
-                        
-                    except Exception as e:
-                        if self.DEBUG:
-                            print(f"Read error: {e}")
-                        time.sleep(0.001)
-                        continue
+                    time.sleep(0.1)
             
         except Exception as e:
             if not self.SILENT:
