@@ -268,32 +268,50 @@ class AudioVisualizer(QMainWindow):
             
             # List all devices to find loopback
             devices = sd.query_devices()
-            if self.DEBUG:
+            if not self.SILENT or self.DEBUG:
                 print("\nAvailable audio devices:")
                 for i, dev in enumerate(devices):
-                    print(f"  {i}: {dev['name']} (in:{dev['max_input_channels']}, out:{dev['max_output_channels']}) @ {dev['default_samplerate']}Hz")
+                    hostapi_info = sd.query_hostapis(dev['hostapi'])
+                    print(f"  {i}: {dev['name']}")
+                    print(f"      API: {hostapi_info['name']}, In:{dev['max_input_channels']}, Out:{dev['max_output_channels']}, SR:{dev['default_samplerate']}Hz")
             
-            # Find loopback device
+            # Find loopback device - prioritize WASAPI devices
             loopback_device = None
             loopback_index = None
             
+            # Strategy 1: Look for explicit loopback/stereo mix devices
             for i, dev in enumerate(devices):
                 name_lower = dev['name'].lower()
                 if dev['max_input_channels'] > 0 and (
                     'stereo mix' in name_lower or
                     'wave out' in name_lower or
                     'loopback' in name_lower or
-                    'what u hear' in name_lower):
+                    'what u hear' in name_lower or
+                    'what you hear' in name_lower):
                     loopback_device = dev
                     loopback_index = i
                     if not self.SILENT:
                         print(f"✓ Found loopback device: {dev['name']}")
                     break
             
+            # Strategy 2: If no explicit loopback, try to use default output device with WASAPI
+            # Note: sounddevice doesn't support true WASAPI loopback, so suggest PyAudio instead
             if loopback_device is None:
                 if not self.SILENT:
-                    print("✗ ERROR: No loopback device found!")
-                    print("Please enable 'Stereo Mix' in Windows Sound settings")
+                    print("\n✗ No loopback device found with sounddevice!")
+                    print("\nTo capture system audio on Windows, you have 2 options:")
+                    print("\nOption 1 - Enable Stereo Mix (works with sounddevice):")
+                    print("  1. Right-click speaker icon in taskbar → Sounds")
+                    print("  2. Go to 'Recording' tab")
+                    print("  3. Right-click in empty area → 'Show Disabled Devices'")
+                    print("  4. Right-click 'Stereo Mix' → Enable")
+                    print("  5. Set it as Default Device (optional)")
+                    print("\nOption 2 - Use PyAudio with WASAPI loopback (recommended):")
+                    print("  1. Uninstall sounddevice: pip uninstall sounddevice")
+                    print("  2. Install PyAudio: pip install pyaudio")
+                    print("  3. Run the program again")
+                    print("\nPyAudio automatically captures audio from your current output device without")
+                    print("requiring Stereo Mix to be enabled.")
                 return
             
             # Use device's native sample rate
@@ -386,40 +404,71 @@ class AudioVisualizer(QMainWindow):
                         print(f"✓ Found WASAPI host API: index {i}")
                     break
             
-            # Find WASAPI loopback device (stereo mix / what you hear)
+            # Find WASAPI loopback device
+            # Strategy: Use the default OUTPUT device as INPUT for WASAPI loopback
             wasapi_info = None
             loopback_device_index = None
+            default_output_index = None
             
             if not self.SILENT:
                 print("Searching for WASAPI loopback device...")
             
-            # Look for loopback device
+            # First, find the default output device using WASAPI
+            if wasapi_host_api is not None:
+                wasapi_api_info = p.get_host_api_info_by_index(wasapi_host_api)
+                default_output_index = wasapi_api_info.get('defaultOutputDevice')
+                
+                if default_output_index is not None and default_output_index >= 0:
+                    output_dev = p.get_device_info_by_index(default_output_index)
+                    if not self.SILENT:
+                        print(f"Default output device: {output_dev['name']}")
+            
+            # Look for devices - prioritize in this order:
+            # 1. Explicit loopback/stereo mix devices
+            # 2. Default output device (for WASAPI loopback)
+            # 3. Any output device as fallback
+            
+            candidates = []
             for i in range(p.get_device_count()):
                 dev_info = p.get_device_info_by_index(i)
                 if self.DEBUG:
-                    print(f"Device {i}: {dev_info['name']} (channels: {dev_info['maxInputChannels']}, host API: {dev_info['hostApi']})")
+                    print(f"Device {i}: {dev_info['name']} (In:{dev_info['maxInputChannels']}, Out:{dev_info['maxOutputChannels']}, API:{dev_info['hostApi']})")
                 
-                # WASAPI loopback devices have specific naming patterns
                 name_lower = dev_info['name'].lower()
-                has_input = dev_info['maxInputChannels'] > 0
+                is_wasapi = wasapi_host_api is not None and dev_info['hostApi'] == wasapi_host_api
                 
-                if has_input and ('stereo mix' in name_lower or 
-                    'wave out' in name_lower or 
-                    'loopback' in name_lower or
-                    'what u hear' in name_lower):
-                    wasapi_info = dev_info
-                    loopback_device_index = i
-                    if not self.SILENT:
-                        print(f"✓ Found loopback device: {dev_info['name']}")
-                    break
+                # Priority 1: Explicit loopback devices
+                if dev_info['maxInputChannels'] > 0 and ('stereo mix' in name_lower or 
+                    'wave out' in name_lower or 'loopback' in name_lower or
+                    'what u hear' in name_lower or 'what you hear' in name_lower):
+                    candidates.append((1, i, dev_info, "explicit loopback"))
+                
+                # Priority 2: Default WASAPI output device (for loopback capture)
+                elif is_wasapi and i == default_output_index and dev_info['maxOutputChannels'] > 0:
+                    candidates.append((2, i, dev_info, "default WASAPI output"))
+                
+                # Priority 3: Any WASAPI output device (can be used for loopback)
+                elif is_wasapi and dev_info['maxOutputChannels'] > 0:
+                    candidates.append((3, i, dev_info, "WASAPI output"))
             
-            if loopback_device_index is None:
+            # Sort by priority and select best candidate
+            if candidates:
+                candidates.sort(key=lambda x: x[0])
+                priority, loopback_device_index, wasapi_info, device_type = candidates[0]
+                
                 if not self.SILENT:
-                    print("✗ ERROR: No loopback device found!")
-                    print("Please enable 'Stereo Mix' in Windows Sound settings:")
-                    print("  1. Right-click speaker icon → Sounds")
-                    print("  2. Recording tab → Right-click → Show Disabled Devices")
-                    print("  3. Enable 'Stereo Mix' or 'Wave Out Mix'")
+                    print(f"✓ Found {device_type} device: {wasapi_info['name']}")
+                    if priority > 1:
+                        print(f"  (Using WASAPI loopback mode - will capture audio playing on this device)")
+            else:
+                if not self.SILENT:
+                    print("✗ ERROR: No suitable audio device found!")
+                    print("\nTroubleshooting:")
+                    print("  1. Make sure your audio device is working")
+                    print("  2. Try enabling 'Stereo Mix' in Windows Sound settings:")
+                    print("     - Right-click speaker icon → Sounds")
+                    print("     - Recording tab → Right-click → Show Disabled Devices")
+                    print("     - Enable 'Stereo Mix' or 'Wave Out Mix'")
                 return
             
             # Get device capabilities
@@ -429,17 +478,29 @@ class AudioVisualizer(QMainWindow):
             default_sample_rate = int(device_info.get('defaultSampleRate', 44100))
             sample_rate = default_sample_rate
             
-            # Get supported parameters from device
-            max_input_channels = int(device_info.get('maxInputChannels', 2))
-            channels = min(self.CHANNELS, max_input_channels)
+            # Determine if we're using loopback mode (output device as input)
+            is_output_device = device_info.get('maxOutputChannels', 0) > 0 and device_info.get('maxInputChannels', 0) == 0
+            use_loopback = is_output_device and wasapi_host_api is not None
+            
+            # For WASAPI loopback, use output channel count; otherwise use input channels
+            if use_loopback:
+                max_channels = int(device_info.get('maxOutputChannels', 2))
+            else:
+                max_channels = int(device_info.get('maxInputChannels', 2))
+            
+            channels = min(self.CHANNELS, max_channels) if max_channels > 0 else 2
             
             if not self.SILENT:
-                print(f"Device info: {default_sample_rate}Hz, {max_input_channels} channels")
+                print(f"Device info: {default_sample_rate}Hz, {max_channels} channels")
+                if use_loopback:
+                    print("Using WASAPI loopback mode (capturing system audio output)")
                 if self.DEBUG:
                     print(f"Device host API: {device_info['hostApi']}")
-                    print(f"Device default input latency: {device_info.get('defaultLowInputLatency', 0)}")
+                    print(f"Is output device: {is_output_device}")
             
-            # Build stream parameters - use WASAPI host API if available
+            # Build stream parameters
+            # IMPORTANT: PyAudio with WASAPI automatically enables loopback when you
+            # open an output device with input=True. No special flags needed!
             stream_params = {
                 'format': pyaudio.paInt16,
                 'channels': channels,
@@ -448,10 +509,6 @@ class AudioVisualizer(QMainWindow):
                 'input_device_index': loopback_device_index,
                 'frames_per_buffer': self.CHUNK,
             }
-            
-            # Add WASAPI-specific parameters if available
-            if wasapi_host_api is not None:
-                stream_params['input_host_api_specific_stream_info'] = None
             
             if not self.SILENT:
                 print(f"Opening audio stream: {sample_rate}Hz, {channels} channels, chunk={self.CHUNK}")
