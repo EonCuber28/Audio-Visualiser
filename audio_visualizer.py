@@ -286,7 +286,6 @@ class AudioVisualizer(QMainWindow):
                 if not self.SILENT:
                     print(f"✓ Capturing from: {default_speaker.name}")
                     print(f"  Channels: {loopback.channels}")
-                    print(f"  Sample rate: {loopback.samplerate} Hz")
                 
             except Exception as e:
                 # Fallback: try to find any loopback device
@@ -309,13 +308,6 @@ class AudioVisualizer(QMainWindow):
                         print("✗ ERROR: No loopback device found!")
                     return
             
-            # Update settings based on device
-            if loopback.samplerate != self.RATE:
-                if not self.SILENT:
-                    print(f"Note: Using {loopback.samplerate}Hz (device default)")
-                self.RATE = int(loopback.samplerate)
-                self.freqs = np.fft.rfftfreq(self.FFT_SIZE, 1.0 / self.RATE)
-            
             # Determine channels
             device_channels = loopback.channels
             if device_channels >= 2:
@@ -331,13 +323,17 @@ class AudioVisualizer(QMainWindow):
                     print(f"Note: Using {channels} channel{'s' if channels > 1 else ''} ({channel_type})")
                 self.CHANNELS = channels
             
+            # Use our configured sample rate (soundcard will handle resampling if needed)
+            sample_rate = self.RATE
+            
             if not self.SILENT:
+                print(f"  Sample rate: {sample_rate} Hz")
                 print("✓ Audio capture started (soundcard WASAPI loopback)")
             
             read_count = 0
             
             # Record in a loop
-            with loopback.recorder(samplerate=self.RATE, channels=channels, blocksize=self.CHUNK) as rec:
+            with loopback.recorder(samplerate=sample_rate, channels=channels) as rec:
                 while self.running:
                     try:
                         # Read audio chunk
