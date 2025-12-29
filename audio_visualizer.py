@@ -316,10 +316,18 @@ class AudioVisualizer(QMainWindow):
             
             # Use device's native sample rate
             sample_rate = int(loopback_device['default_samplerate'])
-            channels = min(self.CHANNELS, loopback_device['max_input_channels'])
+            
+            # Use device's available channels (prefer stereo but accept mono)
+            max_input_channels = loopback_device['max_input_channels']
+            if max_input_channels >= 2:
+                channels = 2  # Use stereo if available
+            elif max_input_channels == 1:
+                channels = 1  # Use mono if that's all we have
+            else:
+                channels = 2  # Fallback to stereo
             
             if not self.SILENT:
-                print(f"Opening stream: {sample_rate}Hz, {channels} channels, chunk={self.CHUNK}")
+                print(f"Opening stream: {sample_rate}Hz, {channels} channel{'s' if channels > 1 else ''}, chunk={self.CHUNK}")
             
             # Update settings if different
             if sample_rate != self.RATE:
@@ -330,7 +338,8 @@ class AudioVisualizer(QMainWindow):
             
             if channels != self.CHANNELS:
                 if not self.SILENT:
-                    print(f"Note: Using {channels} channels")
+                    channel_type = "mono" if channels == 1 else "stereo"
+                    print(f"Note: Using {channels} channel{'s' if channels > 1 else ''} ({channel_type})")
                 self.CHANNELS = channels
             
             if not self.SILENT:
@@ -488,10 +497,17 @@ class AudioVisualizer(QMainWindow):
             else:
                 max_channels = int(device_info.get('maxInputChannels', 2))
             
-            channels = min(self.CHANNELS, max_channels) if max_channels > 0 else 2
+            # Use device's available channels (prefer stereo but accept mono)
+            if max_channels >= 2:
+                channels = 2  # Use stereo if available
+            elif max_channels == 1:
+                channels = 1  # Use mono if that's all we have
+            else:
+                channels = 2  # Fallback to stereo
             
             if not self.SILENT:
-                print(f"Device info: {default_sample_rate}Hz, {max_channels} channels")
+                channel_type = "mono" if channels == 1 else "stereo"
+                print(f"Device info: {default_sample_rate}Hz, {channels} channel{'s' if channels > 1 else ''} ({channel_type})")
                 if use_loopback:
                     print("Using WASAPI loopback mode (capturing system audio output)")
                 if self.DEBUG:
@@ -499,8 +515,6 @@ class AudioVisualizer(QMainWindow):
                     print(f"Is output device: {is_output_device}")
             
             # Build stream parameters
-            # IMPORTANT: PyAudio with WASAPI automatically enables loopback when you
-            # open an output device with input=True. No special flags needed!
             stream_params = {
                 'format': pyaudio.paInt16,
                 'channels': channels,
@@ -512,6 +526,9 @@ class AudioVisualizer(QMainWindow):
             
             if not self.SILENT:
                 print(f"Opening audio stream: {sample_rate}Hz, {channels} channels, chunk={self.CHUNK}")
+                if use_loopback:
+                    print("Note: Attempting to use output device for system audio capture")
+                    print("This requires either Stereo Mix or a PyAudio build with WASAPI loopback support")
             
             # Try to open stream
             stream = None
@@ -522,10 +539,10 @@ class AudioVisualizer(QMainWindow):
                 stream = p.open(**stream_params)
                 if not self.SILENT:
                     print(f"✓ Opened with {sample_rate}Hz")
-            except OSError as e:
+            except (OSError, ValueError) as e:
                 last_error = e
                 if self.DEBUG:
-                    print(f"Failed with {sample_rate}Hz: {e}")
+                    print(f"Failed to open stream: {e}")
             
             # If failed, try common sample rates
             if stream is None:
@@ -545,7 +562,7 @@ class AudioVisualizer(QMainWindow):
                         if not self.SILENT:
                             print(f"✓ Success with {try_rate}Hz")
                         break
-                    except OSError as e:
+                    except (OSError, ValueError) as e:
                         last_error = e
                         if self.DEBUG:
                             print(f"Failed: {e}")
@@ -553,11 +570,27 @@ class AudioVisualizer(QMainWindow):
             
             if stream is None:
                 # Still failed - provide detailed error
-                raise OSError(f"Could not open audio device. Last error: {last_error}\n"
-                             f"This may be because:\n"
-                             f"  1. Stereo Mix is disabled - enable it in Sound settings\n"
-                             f"  2. Another application is using the device\n"
-                             f"  3. Try installing: pip install --upgrade pyaudio")
+                if not self.SILENT:
+                    print(f"\n✗ ERROR: Could not open audio device")
+                    print(f"Last error: {last_error}\n")
+                    print("=" * 70)
+                    print("TO CAPTURE SYSTEM AUDIO ON WINDOWS, YOU MUST ENABLE STEREO MIX:")
+                    print("=" * 70)
+                    print("\n1. Right-click the speaker icon in your taskbar")
+                    print("2. Select 'Sounds' (or 'Sound settings', then click 'Sound Control Panel')")
+                    print("3. Go to the 'Recording' tab")
+                    print("4. Right-click in an empty area and select 'Show Disabled Devices'")
+                    print("5. You should see 'Stereo Mix' appear")
+                    print("6. Right-click 'Stereo Mix' and select 'Enable'")
+                    print("7. Right-click 'Stereo Mix' again and select 'Set as Default Device'")
+                    print("8. Click 'OK' and restart this program\n")
+                    print("NOTE: If Stereo Mix doesn't appear:")
+                    print("  - Your audio driver may not support it")
+                    print("  - Try updating your audio drivers")
+                    print("  - Some Realtek drivers have it disabled by default")
+                    print("  - Virtual audio cables like VB-Cable can work as an alternative")
+                    print("=" * 70)
+                return
             
             # Update RATE if we had to use a different one
             if sample_rate != self.RATE:
@@ -570,7 +603,8 @@ class AudioVisualizer(QMainWindow):
             # Update channels if different
             if channels != self.CHANNELS:
                 if not self.SILENT:
-                    print(f"Note: Using {channels} channels instead of requested {self.CHANNELS}")
+                    channel_type = "mono" if channels == 1 else "stereo"
+                    print(f"Note: Using {channels} channel{'s' if channels > 1 else ''} ({channel_type}) instead of requested {self.CHANNELS}")
                 self.CHANNELS = channels
             
             if not self.SILENT:
@@ -1329,28 +1363,28 @@ class VisualizerCanvas(QWidget):
                 bar_freqs = self.cached_bar_freqs
                 
                 # Interpolate FFT data to display bars
-                # Use cubic interpolation for bass (20-500Hz), linear for higher frequencies
-                bass_mask = bar_freqs <= 500
+                # Use cubic interpolation for bass and mids (20-1000Hz), linear for higher frequencies
+                smooth_mask = bar_freqs <= 1000
                 data_interpolated = np.zeros_like(bar_freqs)
                 
-                if HAS_SCIPY and np.any(bass_mask):
-                    # Bass region: fancy cubic spline interpolation for smooth curves
-                    bass_indices = np.where(bass_mask)[0]
-                    mid_high_indices = np.where(~bass_mask)[0]
+                if HAS_SCIPY and np.any(smooth_mask):
+                    # Smooth region: fancy cubic spline interpolation for smooth curves (20-1000Hz)
+                    smooth_indices = np.where(smooth_mask)[0]
+                    high_indices = np.where(~smooth_mask)[0]
                     
                     try:
-                        # Cubic interpolation for bass (20-500Hz)
-                        bass_interp = interp1d(freqs_filtered, data_filtered, kind='cubic', fill_value='extrapolate')
-                        data_interpolated[bass_indices] = bass_interp(bar_freqs[bass_indices])
+                        # Cubic interpolation for bass/mids (20-1000Hz)
+                        smooth_interp = interp1d(freqs_filtered, data_filtered, kind='cubic', fill_value='extrapolate')
+                        data_interpolated[smooth_indices] = smooth_interp(bar_freqs[smooth_indices])
                         
-                        # Linear interpolation for mid/high frequencies (500Hz+)
-                        if len(mid_high_indices) > 0:
-                            data_interpolated[mid_high_indices] = np.interp(bar_freqs[mid_high_indices], freqs_filtered, data_filtered)
+                        # Linear interpolation for high frequencies (1000Hz+)
+                        if len(high_indices) > 0:
+                            data_interpolated[high_indices] = np.interp(bar_freqs[high_indices], freqs_filtered, data_filtered)
                     except:
                         # Fallback to linear if cubic fails
                         data_interpolated = np.interp(bar_freqs, freqs_filtered, data_filtered)
                 else:
-                    # No scipy or no bass - use linear for everything
+                    # No scipy or no smooth range - use linear for everything
                     data_interpolated = np.interp(bar_freqs, freqs_filtered, data_filtered)
                 
                 log_freqs = bar_freqs
@@ -1366,10 +1400,21 @@ class VisualizerCanvas(QWidget):
                 
                 # Pre-compute colors for this frame to avoid repeated lookups
                 frame_colors = []
+                is_mono = self.parent_visualizer.CHANNELS == 1
+                
                 for i in range(len(log_freqs)):
                     brightness = brightness_interpolated[i]
                     balance = stereo_balance_interpolated[i]
                     freq_ratio = i / len(log_freqs)
+                    
+                    # Mono mode: apply frequency-based brightness gradient
+                    # High frequencies (right side) = brighter, Low frequencies (left side) = dimmer
+                    if is_mono:
+                        # Create gradient: 0.4 (low freq/dim) to 1.0 (high freq/bright)
+                        freq_brightness_boost = 0.4 + (freq_ratio * 0.6)
+                        brightness = brightness * freq_brightness_boost
+                        brightness = min(1.0, brightness)  # Clamp to max 1.0
+                    
                     frame_colors.append(self.get_color_for_brightness(brightness, balance, freq_ratio))
                 
                 # Draw bars - orientation depends on layout
