@@ -2,15 +2,11 @@ numpy>=1.21.0
 PyQt5>=5.15.0
 scipy>=1.7.0
 
-# Windows audio capture (choose one - in order of preference)
-# 1. soundcard - RECOMMENDED (native WASAPI loopback, no Stereo Mix needed)
-# Install with: pip install soundcard
-# soundcard>=0.4.2
+# Windows audio capture - soundcard is REQUIRED for automatic system audio capture
+# It uses native WASAPI loopback which captures all audio playing through speakers
+# without requiring any manual setup like enabling Stereo Mix
+soundcard>=0.4.2; sys_platform == 'win32'
 
-# 2. sounddevice - requires Stereo Mix to be enabled
-# Install with: pip install sounddevice
-# sounddevice>=0.4.6
-
-# 3. PyAudio - fallback option, requires Stereo Mix
-# Install with: pip install pyaudio
-# pyaudio>=0.2.11
+# Alternative Windows options (only needed if soundcard doesn't work):
+# sounddevice>=0.4.6  # Requires Stereo Mix to be manually enabled
+# pyaudio>=0.2.11     # Requires Stereo Mix to be manually enabled

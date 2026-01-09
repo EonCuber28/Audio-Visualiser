@@ -7,3 +7,8 @@
 /test_minimal.py
 /test_palette.py
 /venv
+lib
+lib64
+bin
+include
+__pycache__

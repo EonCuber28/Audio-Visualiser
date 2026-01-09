@@ -51,19 +51,26 @@ This will automatically install all dependencies for your platform (including Py
 **1. Install Python Dependencies**
 
 ```bash
-# Install required packages (sounddevice recommended)
-pip install numpy PyQt5 sounddevice
+# Install required packages - soundcard is RECOMMENDED for hassle-free setup
+pip install numpy PyQt5 soundcard scipy
 
-# Alternative: use PyAudio (may have compatibility issues)
-# pip install numpy PyQt5 pyaudio
-
-# Optional: scipy for better bass interpolation
-pip install scipy
+# soundcard uses native WASAPI loopback to capture ALL system audio
+# without requiring Stereo Mix or any other manual configuration!
 ```
 
-**Note:** `sounddevice` is recommended over `pyaudio` for Windows as it has better WASAPI support and fewer compatibility issues.
+**That's it!** With `soundcard`, the visualizer automatically captures all audio playing through your speakers - no additional setup required.
 
-**2. Enable Stereo Mix**
+**Alternative Libraries (only if soundcard doesn't work):**
+
+```bash
+# sounddevice - requires Stereo Mix to be enabled (see below)
+pip install numpy PyQt5 sounddevice scipy
+
+# pyaudio - also requires Stereo Mix to be enabled
+pip install numpy PyQt5 pyaudio scipy
+```
+
+**If using sounddevice or pyaudio, you must enable Stereo Mix:**
 
 1. Right-click the speaker icon in system tray → **Sounds**
 2. Go to **Recording** tab
@@ -72,7 +79,7 @@ pip install scipy
 5. Right-click → **Enable**
 6. Set as default recording device (optional)
 
-**Note:** If Stereo Mix is not available, you may need to update your audio drivers or use third-party virtual audio cables.
+**Note:** If Stereo Mix is not available, use `soundcard` instead - it doesn't require Stereo Mix.
 
 #### Linux (Ubuntu/Debian)
 

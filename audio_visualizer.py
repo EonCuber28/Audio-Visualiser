@@ -12,7 +12,7 @@ import argparse
 import platform
 from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout
 from PyQt5.QtCore import QTimer, Qt, pyqtSignal, QObject
-from PyQt5.QtGui import QPainter, QColor, QPen, QFont
+from PyQt5.QtGui import QPainter, QColor, QPen, QFont, QPainterPath
 import subprocess
 import threading
 import queue
@@ -64,7 +64,7 @@ class AudioVisualizer(QMainWindow):
     
     def __init__(self, chunk_size=1024, buffer_size=8192, update_rate=60, human_bias=0.5, silent=False, debug=False, happy_mode=False, random_color=False, color_seed=None):
         super().__init__()
-        self.setWindowTitle("Audio Frequency Visualizer")
+        self.setWindowTitle("Autisum Frequency Visualizer")
         self.setGeometry(100, 100, 1200, 600)
         
         # Fullscreen state tracking
@@ -241,8 +241,13 @@ class AudioVisualizer(QMainWindow):
         if self.RANDOM_COLOR:
             self.color_palette = self._generate_color_palette()
             # Clear the canvas color cache to force re-generation with new palette
-            if hasattr(self, 'canvas') and hasattr(self.canvas, 'cached_colors'):
-                self.canvas.cached_colors.clear()
+            if hasattr(self, 'canvas'):
+                if hasattr(self.canvas, 'cached_colors'):
+                    self.canvas.cached_colors.clear()
+                # Invalidate color LUT to force rebuild with new palette
+                if hasattr(self.canvas, '_color_lut'):
+                    self.canvas._color_lut = None
+                    self.canvas._color_lut_mode = None
             if not self.SILENT:
                 print(f"✓ Regenerated palette (seed: {self._palette_seed})")
         
@@ -265,53 +270,96 @@ class AudioVisualizer(QMainWindow):
         else:
             if not self.SILENT:
                 print("✗ ERROR: No audio library installed for Windows.")
-                print("Install one of these:")
-                print("  pip install soundcard  (recommended - native WASAPI loopback)")
-                print("  pip install sounddevice")
-                print("  pip install pyaudio")
+                print("Install soundcard for automatic system audio capture:")
+                print("  pip install soundcard")
+                print("")
+                print("soundcard uses native WASAPI loopback to capture ALL audio")
+                print("playing through your speakers - no extra setup required!")
     
     def _capture_audio_windows_soundcard(self):
-        """Capture audio using soundcard (native WASAPI loopback - best for Windows)"""
+        """Capture audio using soundcard (native WASAPI loopback - best for Windows)
+        
+        This method captures system audio output directly using WASAPI loopback,
+        which requires NO extra setup like enabling Stereo Mix. It automatically
+        captures all audio playing through the default speaker.
+        """
         try:
             import soundcard as sc
             
             if not self.SILENT:
                 print("Using soundcard for audio capture (native WASAPI loopback)...")
             
-            # Get default speaker/loopback
+            # Get default speaker and its loopback - this is the key to capturing
+            # system audio without any extra setup on Windows
+            loopback = None
+            default_speaker = None
+            
             try:
+                # Get default speaker (output device)
                 default_speaker = sc.default_speaker()
-                loopback = sc.get_microphone(id=str(default_speaker.name), include_loopback=True)
-                
                 if not self.SILENT:
-                    print(f"✓ Capturing from: {default_speaker.name}")
-                    print(f"  Channels: {loopback.channels}")
+                    print(f"Default speaker: {default_speaker.name}")
+                
+                # Get the loopback device for the default speaker
+                # This captures ALL audio going to that speaker
+                all_mics = sc.all_microphones(include_loopback=True)
+                
+                # Find the loopback device that matches the default speaker
+                for mic in all_mics:
+                    if mic.isloopback:
+                        # Match by checking if speaker name is in the loopback name
+                        # Loopback devices typically have names like "Speakers (Realtek) [Loopback]"
+                        if default_speaker.name in mic.name or mic.name in default_speaker.name:
+                            loopback = mic
+                            if not self.SILENT:
+                                print(f"✓ Found matching loopback: {mic.name}")
+                            break
+                
+                # If no exact match, try to get loopback by speaker ID
+                if loopback is None:
+                    try:
+                        loopback = sc.get_microphone(id=str(default_speaker.name), include_loopback=True)
+                        if not self.SILENT:
+                            print(f"✓ Got loopback via speaker ID: {loopback.name}")
+                    except Exception:
+                        pass
                 
             except Exception as e:
-                # Fallback: try to find any loopback device
                 if self.DEBUG:
-                    print(f"Could not get default speaker loopback: {e}")
-                    print("Searching for loopback devices...")
+                    print(f"Could not get default speaker: {e}")
+            
+            # Fallback: find any loopback device
+            if loopback is None:
+                if self.DEBUG:
+                    print("Searching for any loopback device...")
                 
-                mics = sc.all_microphones(include_loopback=True)
-                loopback = None
+                all_mics = sc.all_microphones(include_loopback=True)
                 
-                for mic in mics:
+                if self.DEBUG or not self.SILENT:
+                    print("Available loopback devices:")
+                    for mic in all_mics:
+                        if mic.isloopback:
+                            print(f"  - {mic.name} (channels: {mic.channels})")
+                
+                # Pick the first loopback device (usually the default speaker's loopback)
+                for mic in all_mics:
                     if mic.isloopback:
                         loopback = mic
                         if not self.SILENT:
-                            print(f"✓ Found loopback device: {mic.name}")
+                            print(f"✓ Using loopback device: {mic.name}")
                         break
-                
-                if loopback is None:
-                    if not self.SILENT:
-                        print("✗ ERROR: No loopback device found!")
-                    return
             
-            # Determine channels
+            if loopback is None:
+                if not self.SILENT:
+                    print("✗ ERROR: No loopback device found!")
+                    print("This is unusual - WASAPI loopback should always be available on Windows.")
+                    print("Try restarting your audio service or computer.")
+                return
+            
+            # Determine channels - use all available channels from the device
             device_channels = loopback.channels
             if device_channels >= 2:
-                channels = 2
+                channels = min(device_channels, 2)  # Use stereo (2 channels max for our processing)
             elif device_channels == 1:
                 channels = 1
             else:
@@ -328,6 +376,7 @@ class AudioVisualizer(QMainWindow):
             
             if not self.SILENT:
                 print(f"  Sample rate: {sample_rate} Hz")
+                print(f"  Capturing ALL audio from: {loopback.name}")
                 print("✓ Audio capture started (soundcard WASAPI loopback)")
             
             read_count = 0
@@ -770,9 +819,31 @@ class AudioVisualizer(QMainWindow):
                 print("Windows audio capture thread exiting")
     
     def _capture_audio_linux(self):
-        """Capture audio on Linux using PulseAudio/PipeWire parec"""
+        """Capture audio on Linux using PulseAudio/PipeWire parec
+        
+        This captures ALL audio from the default audio output sink's monitor.
+        The monitor source captures everything going to that output device,
+        including audio from all applications mixed together.
+        """
         try:
-            # Get the monitor source name
+            # First, get the default sink (output device)
+            default_sink = None
+            try:
+                result = subprocess.run(
+                    ['pactl', 'get-default-sink'],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                default_sink = result.stdout.strip()
+                if not self.SILENT:
+                    print(f"Default audio sink: {default_sink}")
+            except subprocess.CalledProcessError:
+                # Older pactl versions may not support get-default-sink
+                if self.DEBUG:
+                    print("pactl get-default-sink not available, will search for monitor")
+            
+            # Get all available sources
             result = subprocess.run(
                 ['pactl', 'list', 'sources', 'short'],
                 capture_output=True,
@@ -780,18 +851,56 @@ class AudioVisualizer(QMainWindow):
                 check=True
             )
             
+            # Parse available monitor sources
+            monitor_sources = []
+            for line in result.stdout.strip().split('\n'):
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    source_name = parts[1]
+                    if 'monitor' in source_name.lower():
+                        monitor_sources.append(source_name)
+                        if self.DEBUG:
+                            print(f"Found monitor source: {source_name}")
+            
+            if not monitor_sources:
+                if not self.SILENT:
+                    print("✗ ERROR: No monitor source found!")
+                    print("Make sure PulseAudio or PipeWire is running.")
+                return
+            
+            # Select the best monitor source:
+            # 1. If we know the default sink, use its monitor
+            # 2. Otherwise use the first available monitor (typically the default)
             monitor_source = None
-            for line in result.stdout.split('\n'):
-                if 'monitor' in line.lower():
-                    monitor_source = line.split()[1]
-                    if not self.SILENT:
-                        print(f"✓ Using monitor source: {monitor_source}")
-                    break
+            
+            if default_sink:
+                # Look for the monitor of the default sink
+                # Monitor sources are typically named: <sink_name>.monitor
+                expected_monitor = f"{default_sink}.monitor"
+                for source in monitor_sources:
+                    if source == expected_monitor or default_sink in source:
+                        monitor_source = source
+                        if not self.SILENT:
+                            print(f"✓ Using default sink monitor: {monitor_source}")
+                        break
+            
+            # Fallback to first monitor source
+            if not monitor_source and monitor_sources:
+                monitor_source = monitor_sources[0]
+                if not self.SILENT:
+                    print(f"✓ Using monitor source: {monitor_source}")
             
             if not monitor_source:
                 if not self.SILENT:
                     print("✗ ERROR: No monitor source found!")
                 return
+            
+            if not self.SILENT:
+                print(f"  Capturing ALL audio from this output device")
+                if len(monitor_sources) > 1:
+                    print(f"  (Other available monitors: {', '.join(m for m in monitor_sources if m != monitor_source)})")
             
             # Start parec to capture audio - use raw format to avoid conversion issues
             bytes_per_sample = 2  # int16
@@ -1178,6 +1287,14 @@ class VisualizerCanvas(QWidget):
         self.actual_min_freq = 20.0  # Actual minimum frequency being displayed
         self.actual_max_freq = 10000.0  # Actual maximum frequency being displayed
         
+        # Pre-computed interpolation cache for cubic smoothing
+        self.cached_cubic_interp = None  # scipy interp1d object
+        self.cached_freqs_hash = None  # Hash of freqs to detect changes
+        
+        # Pre-computed brightness/color arrays (avoid per-bar computation)
+        self.brightness_array = np.zeros(512)
+        self.stereo_balance_array = np.zeros(512)
+        
         # Peak hold lines
         self.peak_hold = np.zeros(2048)  # Peak positions for each bar
         self.peak_fall_rate = 0.006  # How fast peaks fall (per frame)
@@ -1185,6 +1302,10 @@ class VisualizerCanvas(QWidget):
         # Frame rate throttling (slightly higher threshold to ensure 60 FPS)
         self.last_paint_time = 0.0
         self.min_paint_interval = 0.0165  # ~60 FPS max (16.5ms)
+        
+        # Pre-compute color LUT for fast lookups (100 brightness x 100 balance levels)
+        self._color_lut = None
+        self._color_lut_mode = None  # Track which mode LUT was built for
         
         # Enable double buffering to prevent tearing
         self.setAttribute(Qt.WA_OpaquePaintEvent, False)  # Let Qt handle background
@@ -1333,6 +1454,96 @@ class VisualizerCanvas(QWidget):
         color = QColor(int(r), int(g), int(b))
         self.cached_colors[cache_key] = color
         return color
+    
+    def _build_color_lut(self, num_brightness=64, num_balance=64):
+        """Pre-build color lookup table for fast color computation
+        
+        Creates a 2D array of QColor objects indexed by:
+        - brightness (0-63 -> 0.0-1.0)
+        - stereo balance (0-63 -> -1.0 to +1.0)
+        """
+        mode_key = (self.parent_visualizer.HAPPY_MODE, 
+                    self.parent_visualizer.RANDOM_COLOR,
+                    id(self.parent_visualizer.color_palette) if self.parent_visualizer.color_palette else None)
+        
+        # Only rebuild if mode changed
+        if self._color_lut is not None and self._color_lut_mode == mode_key:
+            return
+        
+        self._color_lut = [[None for _ in range(num_balance)] for _ in range(num_brightness)]
+        self._color_lut_mode = mode_key
+        
+        for bi in range(num_brightness):
+            brightness = bi / (num_brightness - 1)
+            for si in range(num_balance):
+                balance = (si / (num_balance - 1)) * 2.0 - 1.0  # Map to [-1, 1]
+                
+                # Compute color based on mode
+                if self.parent_visualizer.RANDOM_COLOR and self.parent_visualizer.color_palette:
+                    color = self._compute_random_palette_color(brightness, balance)
+                elif self.parent_visualizer.HAPPY_MODE:
+                    color = self._compute_happy_color(brightness, balance)
+                else:
+                    color = self._compute_normal_color(brightness, balance)
+                
+                self._color_lut[bi][si] = color
+    
+    def _compute_normal_color(self, brightness, stereo_balance):
+        """Compute normal mode color without caching"""
+        lut_x = (stereo_balance + 1.0) * 0.5
+        r = np.interp(lut_x, self._anchor_positions, self._normal_anchors[:, 0])
+        g = np.interp(lut_x, self._anchor_positions, self._normal_anchors[:, 1])
+        b = np.interp(lut_x, self._anchor_positions, self._normal_anchors[:, 2])
+        brightness_scaled = brightness ** 0.4
+        return QColor(int(r * brightness_scaled), int(g * brightness_scaled), int(b * brightness_scaled))
+    
+    def _compute_happy_color(self, brightness, stereo_balance):
+        """Compute happy mode color without caching"""
+        brightness_joy = brightness ** 0.55
+        brightness_lifted = 0.30 + (brightness_joy * 0.70)
+        lut_x = (stereo_balance + 1.0) * 0.5
+        r = np.interp(lut_x, self._anchor_positions, self._happy_anchors[:, 0])
+        g = np.interp(lut_x, self._anchor_positions, self._happy_anchors[:, 1])
+        b = np.interp(lut_x, self._anchor_positions, self._happy_anchors[:, 2])
+        r = r * brightness_lifted
+        g = g * brightness_lifted
+        b = b * brightness_lifted
+        glow = 0.10 * brightness_lifted
+        r = min(255, r + glow * 255)
+        g = min(255, g + glow * 255)
+        b = min(255, b + glow * 255)
+        return QColor(int(r), int(g), int(b))
+    
+    def _compute_random_palette_color(self, brightness, stereo_balance):
+        """Compute random palette color without caching"""
+        palette = self.parent_visualizer.color_palette
+        if stereo_balance <= 0:
+            t = (stereo_balance + 1.0)
+            color_left = palette[0]
+            color_center = palette[1]
+            r = color_left[0] * (1 - t) + color_center[0] * t
+            g = color_left[1] * (1 - t) + color_center[1] * t
+            b = color_left[2] * (1 - t) + color_center[2] * t
+        else:
+            t = stereo_balance
+            color_center = palette[1]
+            color_right = palette[2]
+            r = color_center[0] * (1 - t) + color_right[0] * t
+            g = color_center[1] * (1 - t) + color_right[1] * t
+            b = color_center[2] * (1 - t) + color_right[2] * t
+        brightness_scaled = brightness ** 0.4
+        return QColor(int(r * brightness_scaled), int(g * brightness_scaled), int(b * brightness_scaled))
+    
+    def get_color_from_lut(self, brightness, stereo_balance):
+        """Fast color lookup from pre-computed LUT"""
+        if self._color_lut is None:
+            self._build_color_lut()
+        
+        # Quantize to LUT indices
+        bi = min(63, max(0, int(brightness * 63)))
+        si = min(63, max(0, int((stereo_balance + 1.0) * 31.5)))
+        
+        return self._color_lut[bi][si]
         
     def update_data(self, fft_data, freqs, stereo_balance=None, waveform=None):
         """Update the FFT data and trigger repaint"""
@@ -1464,6 +1675,8 @@ class VisualizerCanvas(QWidget):
                     self.actual_max_freq = 10000.0
                     self.cached_bar_freqs = np.logspace(np.log10(min_freq), np.log10(10000), num_bars)
                     self.cached_num_bars = num_bars
+                    # Invalidate cubic interpolation cache when bar freqs change
+                    self.cached_cubic_interp = None
                     
                     # Debug: Show bass region detail
                     if self.parent_visualizer.DEBUG:
@@ -1481,24 +1694,40 @@ class VisualizerCanvas(QWidget):
                 
                 bar_freqs = self.cached_bar_freqs
                 
-                # Interpolate FFT data to display bars
-                # Use cubic interpolation for bass and mids (20-1000Hz), linear for higher frequencies
+                # Interpolate FFT data to display bars with cubic smoothing for bass/mids
+                # Use cached interpolator for better performance
                 smooth_mask = bar_freqs <= 1000
                 data_interpolated = np.zeros_like(bar_freqs)
                 
+                # Check if we need to rebuild the cubic interpolator
+                freqs_hash = (len(freqs_filtered), freqs_filtered[0] if len(freqs_filtered) > 0 else 0, 
+                              freqs_filtered[-1] if len(freqs_filtered) > 0 else 0)
+                
                 if HAS_SCIPY and np.any(smooth_mask):
-                    # Smooth region: fancy cubic spline interpolation for smooth curves (20-1000Hz)
                     smooth_indices = np.where(smooth_mask)[0]
                     high_indices = np.where(~smooth_mask)[0]
                     
                     try:
-                        # Cubic interpolation for bass/mids (20-1000Hz)
-                        smooth_interp = interp1d(freqs_filtered, data_filtered, kind='cubic', fill_value='extrapolate')
-                        data_interpolated[smooth_indices] = smooth_interp(bar_freqs[smooth_indices])
+                        # Rebuild cubic interpolator only when frequency bins change
+                        if self.cached_cubic_interp is None or self.cached_freqs_hash != freqs_hash:
+                            self.cached_cubic_interp = interp1d(freqs_filtered, data_filtered, 
+                                                                kind='cubic', fill_value='extrapolate',
+                                                                assume_sorted=True)
+                            self.cached_freqs_hash = freqs_hash
+                        else:
+                            # Update y-values in place for faster interpolation
+                            # scipy interp1d doesn't support updating y, so we rebuild but it's faster with cached x
+                            self.cached_cubic_interp = interp1d(freqs_filtered, data_filtered,
+                                                                kind='cubic', fill_value='extrapolate',
+                                                                assume_sorted=True)
                         
-                        # Linear interpolation for high frequencies (1000Hz+)
+                        # Cubic interpolation for bass/mids (20-1000Hz)
+                        data_interpolated[smooth_indices] = self.cached_cubic_interp(bar_freqs[smooth_indices])
+                        
+                        # Linear interpolation for high frequencies (1000Hz+) - faster
                         if len(high_indices) > 0:
-                            data_interpolated[high_indices] = np.interp(bar_freqs[high_indices], freqs_filtered, data_filtered)
+                            data_interpolated[high_indices] = np.interp(bar_freqs[high_indices], 
+                                                                        freqs_filtered, data_filtered)
                     except:
                         # Fallback to linear if cubic fails
                         data_interpolated = np.interp(bar_freqs, freqs_filtered, data_filtered)
@@ -1508,107 +1737,110 @@ class VisualizerCanvas(QWidget):
                 
                 log_freqs = bar_freqs
                 
-                # Interpolate stereo balance data for each bar
+                # Vectorized stereo balance interpolation
                 stereo_balance_interpolated = np.interp(bar_freqs, freqs_filtered, self.stereo_balance[mask])
                 
-                # Step 7: Loudness → Brightness (optimized: vectorized operations)
+                # Step 7: Vectorized brightness computation
                 if self.parent_visualizer.HAPPY_MODE:
                     brightness_interpolated = np.clip((data_interpolated + 60.0) * (1.0/60.0), 0.0, 1.0)
                 else:
                     brightness_interpolated = np.clip((data_interpolated + 80.0) * 0.0125, 0.0, 1.0)
                 
-                # Pre-compute colors for this frame to avoid repeated lookups
-                frame_colors = []
+                # Ensure color LUT is built
+                self._build_color_lut()
+                
+                # Vectorized peak hold update (much faster than loop)
+                if len(self.peak_hold) != num_bars:
+                    self.peak_hold = np.zeros(num_bars)
+                
+                # Update peaks: keep max of current brightness and decayed peak
+                self.peak_hold = np.maximum(brightness_interpolated, 
+                                            np.maximum(0, self.peak_hold - self.peak_fall_rate))
+                
+                # Pre-compute all bar positions and dimensions
+                num_freqs = len(log_freqs)
                 is_mono = self.parent_visualizer.CHANNELS == 1
                 
-                for i in range(len(log_freqs)):
-                    brightness = brightness_interpolated[i]
-                    balance = stereo_balance_interpolated[i]
-                    freq_ratio = i / len(log_freqs)
-                    
-                    # Mono mode: apply frequency-based brightness gradient
-                    # High frequencies (right side) = brighter, Low frequencies (left side) = dimmer
-                    if is_mono:
-                        # Create gradient: 0.4 (low freq/dim) to 1.0 (high freq/bright)
-                        freq_brightness_boost = 0.4 + (freq_ratio * 0.6)
-                        brightness = brightness * freq_brightness_boost
-                        brightness = min(1.0, brightness)  # Clamp to max 1.0
-                    
-                    frame_colors.append(self.get_color_for_brightness(brightness, balance, freq_ratio))
+                # Mono brightness adjustment (vectorized)
+                if is_mono:
+                    freq_ratios = np.arange(num_freqs) / num_freqs
+                    freq_brightness_boost = 0.4 + (freq_ratios * 0.6)
+                    brightness_interpolated = np.clip(brightness_interpolated * freq_brightness_boost, 0.0, 1.0)
+                
+                # Get all colors at once using LUT (vectorized index computation)
+                brightness_indices = np.clip((brightness_interpolated * 63).astype(np.int32), 0, 63)
+                balance_indices = np.clip(((stereo_balance_interpolated + 1.0) * 31.5).astype(np.int32), 0, 63)
                 
                 # Draw bars - orientation depends on layout
                 painter.setPen(Qt.NoPen)
                 
-                # Resize peak hold array if needed
-                if len(self.peak_hold) != num_bars:
-                    self.peak_hold = np.zeros(num_bars)
-                
                 if use_vertical:
                     # Vertical layout - bars linearly spaced, representing logarithmic frequencies
                     bar_height = graph_height / num_bars
-                    num_freqs = len(log_freqs)
-                    peak_fall = self.peak_fall_rate
+                    bar_h = max(1, int(bar_height) + 1)
                     
+                    # Pre-compute y positions for all bars
+                    y_positions = margin_top + (np.arange(num_freqs) * bar_height).astype(np.int32)
+                    bar_widths = (brightness_interpolated[num_freqs-1::-1] * graph_width + 0.5).astype(np.int32)
+                    peak_xs = (self.peak_hold[num_freqs-1::-1] * graph_width + 0.5).astype(np.int32) + margin_left
+                    
+                    # Draw all bars (skip zero-height bars)
                     for i in range(num_freqs):
                         idx = num_freqs - 1 - i
-                        brightness = brightness_interpolated[idx]
                         
-                        # Update peak hold always
-                        self.peak_hold[i] = brightness if brightness > self.peak_hold[i] else max(0, self.peak_hold[i] - peak_fall)
-                        
-                        # Skip drawing if brightness too low (optimization)
-                        if brightness < 0.01 and self.peak_hold[i] < 0.01:
+                        # Skip if both bar and peak are negligible
+                        if brightness_interpolated[idx] < 0.01 and self.peak_hold[i] < 0.01:
                             continue
                         
-                        # Linear position from top to bottom with overlap to prevent gaps
-                        y_pos = margin_top + int(i * bar_height)
-                        # Add 1px to height to ensure no gaps between bars
-                        bar_h = max(1, int(bar_height) + 1)
-                        bar_width_val = int(brightness * graph_width + 0.5)
+                        y_pos = y_positions[i]
+                        bar_width_val = bar_widths[i]
+                        
+                        # Get color from LUT
+                        color = self._color_lut[brightness_indices[idx]][balance_indices[idx]]
                         
                         if bar_width_val > 0:
-                            painter.setBrush(frame_colors[idx])
+                            painter.setBrush(color)
                             painter.drawRect(margin_left, y_pos, bar_width_val, bar_h)
                         
-                        # Draw peak hold line (simplified - no color lookup)
+                        # Draw peak hold line
                         if self.peak_hold[i] > 0.001:
-                            peak_x = margin_left + int(self.peak_hold[i] * graph_width + 0.5)
-                            painter.setPen(QPen(frame_colors[idx], 1))
+                            peak_x = peak_xs[i]
+                            painter.setPen(QPen(color, 1))
                             painter.drawLine(peak_x, y_pos, peak_x, y_pos + bar_h)
                             painter.setPen(Qt.NoPen)
 
                 else:
                     # Horizontal layout - bars linearly spaced, representing logarithmic frequencies
-                    bar_width_val = graph_width / num_bars
-                    num_freqs = len(log_freqs)
-                    peak_fall = self.peak_fall_rate
+                    bar_width = graph_width / num_bars
+                    bar_w = max(1, int(bar_width) + 1)
                     
+                    # Pre-compute x positions for all bars
+                    x_positions = margin_left + (np.arange(num_freqs) * bar_width).astype(np.int32)
+                    bar_heights = (brightness_interpolated * graph_height + 0.5).astype(np.int32)
+                    peak_heights = (self.peak_hold * graph_height + 0.5).astype(np.int32)
+                    
+                    # Draw all bars
                     for i in range(num_freqs):
-                        brightness = brightness_interpolated[i]
-                        
-                        # Update peak hold always
-                        self.peak_hold[i] = brightness if brightness > self.peak_hold[i] else max(0, self.peak_hold[i] - peak_fall)
-                        
-                        # Skip drawing if brightness too low (optimization)
-                        if brightness < 0.01 and self.peak_hold[i] < 0.01:
+                        # Skip if both bar and peak are negligible
+                        if brightness_interpolated[i] < 0.01 and self.peak_hold[i] < 0.01:
                             continue
                         
-                        # Linear position from left to right with overlap to prevent gaps
-                        x_pos = margin_left + int(i * bar_width_val)
-                        # Add 1px to width to ensure no gaps between bars
-                        bar_w = max(1, int(bar_width_val) + 1)
-                        bar_height = int(brightness * graph_height + 0.5)
+                        x_pos = x_positions[i]
+                        bar_height_val = bar_heights[i]
                         
-                        if bar_height > 0:
-                            painter.setBrush(frame_colors[i])
-                            y_pos = margin_top + (graph_height - bar_height)
-                            painter.drawRect(x_pos, y_pos, bar_w, bar_height)
+                        # Get color from LUT
+                        color = self._color_lut[brightness_indices[i]][balance_indices[i]]
                         
-                        # Draw peak hold line (simplified - no color lookup)
+                        if bar_height_val > 0:
+                            painter.setBrush(color)
+                            y_pos = margin_top + (graph_height - bar_height_val)
+                            painter.drawRect(x_pos, y_pos, bar_w, bar_height_val)
+                        
+                        # Draw peak hold line
                         if self.peak_hold[i] > 0.001:
-                            peak_height = int(self.peak_hold[i] * graph_height + 0.5)
-                            peak_y = margin_top + (graph_height - peak_height)
-                            painter.setPen(QPen(frame_colors[i], 1))
+                            peak_h = peak_heights[i]
+                            peak_y = margin_top + (graph_height - peak_h)
+                            painter.setPen(QPen(color, 1))
                             painter.drawLine(x_pos, peak_y, x_pos + bar_w, peak_y)
                             painter.setPen(Qt.NoPen)
         
@@ -1631,25 +1863,29 @@ class VisualizerCanvas(QWidget):
             painter.setPen(QPen(QColor(40, 40, 50), 1))
             painter.drawLine(scope_left, center_y, scope_left + scope_width, center_y)
             
-            # Draw waveform (optimized: reduced resolution)
-            painter.setPen(QPen(QColor(100, 200, 255), 1))
+            # Draw waveform using QPainterPath for batch rendering (much faster)
             if len(self.waveform_data) > 1:
                 num_points = min(len(self.waveform_data), scope_width) // 2  # Half resolution for performance
                 step = len(self.waveform_data) / num_points
                 scale = scope_height * 0.45
-                inv_num_points = scope_width / num_points
+                x_scale = scope_width / num_points
                 
-                for i in range(num_points - 1):
-                    idx1 = int(i * step)
-                    idx2 = int((i + 1) * step)
-                    
-                    # Normalize waveform to oscilloscope height
-                    y1 = center_y - int(np.clip(self.waveform_data[idx1], -1.0, 1.0) * scale)
-                    y2 = center_y - int(np.clip(self.waveform_data[idx2], -1.0, 1.0) * scale)
-                    x1 = scope_left + int(i * inv_num_points)
-                    x2 = scope_left + int((i + 1) * inv_num_points)
-                    
-                    painter.drawLine(x1, y1, x2, y2)
+                # Pre-compute all points using vectorized operations
+                indices = (np.arange(num_points) * step).astype(np.int32)
+                indices = np.clip(indices, 0, len(self.waveform_data) - 1)
+                y_values = center_y - (np.clip(self.waveform_data[indices], -1.0, 1.0) * scale).astype(np.int32)
+                x_values = scope_left + (np.arange(num_points) * x_scale).astype(np.int32)
+                
+                # Build path from pre-computed points
+                path = QPainterPath()
+                path.moveTo(x_values[0], y_values[0])
+                for i in range(1, num_points):
+                    path.lineTo(x_values[i], y_values[i])
+                
+                # Draw as a single line (no fill)
+                painter.setPen(QPen(QColor(100, 200, 255), 1))
+                painter.setBrush(Qt.NoBrush)  # Ensure no fill
+                painter.drawPath(path)
             
             # Remove clipping
             painter.setClipping(False)
