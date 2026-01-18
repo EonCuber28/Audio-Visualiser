@@ -7,9 +7,42 @@ Supports: Linux (PulseAudio/PipeWire), Windows 10/11 (WASAPI Loopback)
 
 import sys
 import numpy as np
+
+# NumPy 2.x compatibility: add fromstring shim BEFORE any other imports
+# This must be done early so soundcard can use it
+if not hasattr(np, 'fromstring'):
+    def _fromstring_compat(string, dtype=float, count=-1, sep='', offset=0):
+        # NumPy 2.x removed fromstring, redirect to frombuffer
+        if sep != '':
+            # Text mode - not supported in frombuffer
+            raise NotImplementedError("Text mode fromstring not supported in NumPy 2.x")
+        # Binary mode - frombuffer has different signature
+        return np.frombuffer(string, dtype=dtype, count=count, offset=offset)
+    
+    np.fromstring = _fromstring_compat
+else:
+    # If fromstring somehow exists, still override with frombuffer version
+    _orig_fromstring = np.fromstring
+    def _fromstring_compat(string, dtype=float, count=-1, sep='', offset=0, like=None):
+        # NumPy 2.x: handle text mode
+        if sep != '':
+            raise NotImplementedError("Text mode fromstring not supported in NumPy 2.x")
+        # Use frombuffer for binary mode
+        return np.frombuffer(string, dtype=dtype, count=count, offset=offset)
+    
+    np.fromstring = _fromstring_compat
+
+# Import soundcard IMMEDIATELY after numpy patch is in place
+try:
+    import soundcard as sc
+    SOUNDCARD_AVAILABLE = True
+except ImportError:
+    SOUNDCARD_AVAILABLE = False
+
 import struct
 import argparse
 import platform
+import importlib.util
 from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout
 from PyQt5.QtCore import QTimer, Qt, pyqtSignal, QObject
 from PyQt5.QtGui import QPainter, QColor, QPen, QFont, QPainterPath
@@ -19,36 +52,29 @@ import queue
 import time
 import random
 
+# Fix Windows console UTF-8 encoding for checkmark characters
+if platform.system() == 'Windows':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except (AttributeError, OSError):
+        pass
+
 # Platform detection
 IS_WINDOWS = platform.system() == 'Windows'
 IS_LINUX = platform.system() == 'Linux'
 
-# Try to import soundcard for Windows (native WASAPI loopback - best option)
+# Detect availability without importing (avoid COM init before Qt)
+# Check all audio libraries for Windows
 HAS_SOUNDCARD = False
-if IS_WINDOWS:
-    try:
-        import soundcard as sc
-        HAS_SOUNDCARD = True
-    except ImportError:
-        pass
-
-# Fallback: Try to import sounddevice for Windows
 HAS_SOUNDDEVICE = False
-if IS_WINDOWS and not HAS_SOUNDCARD:
-    try:
-        import sounddevice as sd
-        HAS_SOUNDDEVICE = True
-    except ImportError:
-        pass
-
-# Fallback: Try to import PyAudio for Windows WASAPI loabback
 HAS_PYAUDIO = False
-if IS_WINDOWS and not HAS_SOUNDCARD and not HAS_SOUNDDEVICE:
-    try:
-        import pyaudio
-        HAS_PYAUDIO = True
-    except ImportError:
-        pass
+
+if IS_WINDOWS:
+    HAS_SOUNDCARD = importlib.util.find_spec('soundcard') is not None
+    HAS_SOUNDDEVICE = importlib.util.find_spec('sounddevice') is not None
+    HAS_PYAUDIO = (importlib.util.find_spec('pyaudiowpatch') is not None) or \
+                  (importlib.util.find_spec('pyaudio') is not None)
 
 # Try to import scipy for better interpolation, fall back to linear if not available
 try:
@@ -253,6 +279,8 @@ class AudioVisualizer(QMainWindow):
         
     def capture_audio(self):
         """Capture audio using platform-specific method"""
+        if self.DEBUG:
+            print(f"Audio capture thread started (platform: {'Windows' if IS_WINDOWS else 'Linux'})")
         if IS_WINDOWS:
             self._capture_audio_windows()
         else:
@@ -260,9 +288,17 @@ class AudioVisualizer(QMainWindow):
     
     def _capture_audio_windows(self):
         """Capture audio on Windows using soundcard, sounddevice, or PyAudio WASAPI loopback"""
-        # Try soundcard first (native WASAPI loopback - no Stereo Mix needed!)
+        if self.DEBUG:
+            print(f"Windows capture: HAS_SOUNDCARD={HAS_SOUNDCARD}, HAS_SOUNDDEVICE={HAS_SOUNDDEVICE}, HAS_PYAUDIO={HAS_PYAUDIO}")
+        # Try soundcard first - it handles multi-channel WASAPI loopback better
         if HAS_SOUNDCARD:
+            if self.DEBUG:
+                print("Calling _capture_audio_windows_soundcard()...")
             self._capture_audio_windows_soundcard()
+        elif HAS_PYAUDIO:
+            if self.DEBUG:
+                print("Calling _capture_audio_windows_pyaudio()...")
+            self._capture_audio_windows_pyaudio()
         elif HAS_SOUNDDEVICE:
             self._capture_audio_windows_sounddevice()
         elif HAS_PYAUDIO:
@@ -283,9 +319,14 @@ class AudioVisualizer(QMainWindow):
         which requires NO extra setup like enabling Stereo Mix. It automatically
         captures all audio playing through the default speaker.
         """
+        global SOUNDCARD_AVAILABLE
+        
+        if not SOUNDCARD_AVAILABLE:
+            if not self.SILENT:
+                print("soundcard not available, falling back to pyaudiowpatch...")
+            return self._capture_audio_windows_pyaudiowpatch()
+        
         try:
-            import soundcard as sc
-            
             if not self.SILENT:
                 print("Using soundcard for audio capture (native WASAPI loopback)...")
             
@@ -300,20 +341,27 @@ class AudioVisualizer(QMainWindow):
                 if not self.SILENT:
                     print(f"Default speaker: {default_speaker.name}")
                 
-                # Get the loopback device for the default speaker
-                # This captures ALL audio going to that speaker
+                # Get all microphones - look for Stereo Mix or loopback devices
                 all_mics = sc.all_microphones(include_loopback=True)
                 
-                # Find the loopback device that matches the default speaker
+                # First priority: Look for Stereo Mix (most reliable)
                 for mic in all_mics:
-                    if mic.isloopback:
-                        # Match by checking if speaker name is in the loopback name
-                        # Loopback devices typically have names like "Speakers (Realtek) [Loopback]"
-                        if default_speaker.name in mic.name or mic.name in default_speaker.name:
-                            loopback = mic
-                            if not self.SILENT:
-                                print(f"✓ Found matching loopback: {mic.name}")
-                            break
+                    if 'stereo mix' in mic.name.lower():
+                        loopback = mic
+                        if not self.SILENT:
+                            print(f"✓ Found Stereo Mix: {mic.name}")
+                        break
+                
+                # Second priority: Find the loopback device that matches the default speaker
+                if loopback is None:
+                    for mic in all_mics:
+                        if mic.isloopback:
+                            # Match by checking if speaker name is in the loopback name
+                            if default_speaker.name in mic.name or mic.name in default_speaker.name:
+                                loopback = mic
+                                if not self.SILENT:
+                                    print(f"✓ Found matching loopback: {mic.name}")
+                                break
                 
                 # If no exact match, try to get loopback by speaker ID
                 if loopback is None:
@@ -377,39 +425,109 @@ class AudioVisualizer(QMainWindow):
             if not self.SILENT:
                 print(f"  Sample rate: {sample_rate} Hz")
                 print(f"  Capturing ALL audio from: {loopback.name}")
+                print(f"  Channels: {channels}")
                 print("✓ Audio capture started (soundcard WASAPI loopback)")
+                print(f"  Thread starting capture loop...")
             
             read_count = 0
             
-            # Record in a loop
-            with loopback.recorder(samplerate=sample_rate, channels=channels) as rec:
-                while self.running:
-                    try:
-                        # Read audio chunk
-                        data = rec.record(numframes=self.CHUNK)
-                        
-                        # Convert float32 data to int16 for compatibility
-                        data_int16 = (data * 32767).astype(np.int16)
-                        data_bytes = data_int16.tobytes()
-                        
-                        read_count += 1
-                        
-                        # Put data in queue (drop old data if queue is full)
-                        if self.audio_queue.full():
-                            try:
-                                self.audio_queue.get_nowait()
-                            except queue.Empty:
-                                pass
-                        self.audio_queue.put(data_bytes)
-                        
-                        if self.DEBUG and read_count % 100 == 0:
-                            print(f"Audio thread: {read_count} chunks, queue: {self.audio_queue.qsize()}")
-                    
-                    except Exception as e:
+            # Record in a loop with automatic stream recreation
+            last_err_msg = None
+            last_err_time = 0.0
+            suppressed = 0
+            consecutive_errors = 0
+            chunk_size_idx = 0
+            # Try different chunk sizes (10ms, 20ms, 5ms) to find one that works
+            chunk_sizes_ms = [10, 20, 5]
+            
+            while self.running:
+                # Align chunk to WASAPI period
+                chunk_ms = chunk_sizes_ms[chunk_size_idx % len(chunk_sizes_ms)]
+                chunk_frames = max(1, int(sample_rate * chunk_ms / 1000))
+                
+                if self.DEBUG and chunk_size_idx > 0:
+                    print(f"Trying chunk size: {chunk_ms}ms ({chunk_frames} frames)")
+                
+                try:
+                    with loopback.recorder(samplerate=sample_rate, channels=channels) as rec:
                         if self.DEBUG:
-                            print(f"Read error: {e}")
-                        time.sleep(0.001)
-                        continue
+                            print(f"[SOUNDCARD] Recorder opened, entering read loop...")
+                        
+                        while self.running:
+                            try:
+                                # Read audio chunk
+                                if self.DEBUG and read_count == 0:
+                                    print(f"[SOUNDCARD] About to read {chunk_frames} frames...")
+                                
+                                data = rec.record(numframes=chunk_frames)
+                                
+                                if self.DEBUG and read_count == 0:
+                                    print(f"[SOUNDCARD] ✓ Read succeeded, got {len(data)} samples")
+                                
+                                # Convert float32 data to int16 for compatibility
+                                data_int16 = (data * 32767).astype(np.int16)
+                                data_bytes = data_int16.tobytes()
+                                
+                                read_count += 1
+                                consecutive_errors = 0
+                                
+                                # Put data in queue (drop old data if queue is full)
+                                if self.audio_queue.full():
+                                    try:
+                                        self.audio_queue.get_nowait()
+                                    except queue.Empty:
+                                        pass
+                                self.audio_queue.put(data_bytes)
+                                
+                                if self.DEBUG and read_count % 30 == 1:  # Every ~0.5s
+                                    data_int = np.frombuffer(data_bytes, dtype=np.int16)
+                                    rms = np.sqrt(np.mean(data_int.astype(np.float32)**2))
+                                    print(f"[SOUNDCARD] chunk {read_count}: queue={self.audio_queue.qsize()}, RMS={rms:.1f}")
+                                    print(f"📊 soundcard chunk {read_count}: queue={self.audio_queue.qsize()}, size={len(data_bytes)}B, RMS={rms:.1f}")
+                                elif self.DEBUG and read_count == 1:
+                                    print(f"First chunk captured! Size: {len(data_bytes)} bytes, channels: {channels}")
+                                # Reset error throttling on successful read
+                                suppressed = 0
+                                last_err_msg = None
+                                last_err_time = 0.0
+                            
+                            except Exception as e:
+                                consecutive_errors += 1
+                                # Throttle repeated identical errors to avoid CLI flood
+                                msg = f"Read error: {e}"
+                                now = time.perf_counter()
+                                if last_err_msg == msg and (now - last_err_time) < 5.0:
+                                    suppressed += 1
+                                else:
+                                    if self.DEBUG and suppressed > 0 and last_err_msg:
+                                        print(f"{last_err_msg} (suppressed {suppressed} repeats)")
+                                    if self.DEBUG:
+                                        print(msg)
+                                    last_err_msg = msg
+                                    last_err_time = now
+                                    suppressed = 0
+                                # Back off briefly to let WASAPI recover
+                                time.sleep(0.02)
+                                
+                                # If errors persist, break to recreate recorder
+                                if consecutive_errors >= 30:
+                                    if self.DEBUG:
+                                        print(f"Recreating recorder after {consecutive_errors} errors...")
+                                    break
+                
+                except Exception as open_err:
+                    if self.DEBUG:
+                        print(f"Recorder creation error: {open_err}")
+                    time.sleep(0.2)
+                
+                # Try next chunk size if we had persistent errors
+                if consecutive_errors >= 30:
+                    chunk_size_idx += 1
+                    consecutive_errors = 0
+                    time.sleep(0.1)
+                else:
+                    # Normal exit, don't cycle chunk sizes
+                    break
         
         except Exception as e:
             if not self.SILENT:
@@ -567,6 +685,17 @@ class AudioVisualizer(QMainWindow):
             return
         
         try:
+            # Prefer pyaudiowpatch if available (WASAPI loopback support)
+            using_pyaudiowpatch = False
+            try:
+                import pyaudiowpatch as pyaudio
+                using_pyaudiowpatch = True
+                if self.DEBUG:
+                    print("Using pyaudiowpatch for WASAPI loopback")
+            except ImportError:
+                import pyaudio
+                if self.DEBUG:
+                    print("Using standard PyAudio")
             p = pyaudio.PyAudio()
             
             # Find WASAPI host API
@@ -614,19 +743,43 @@ class AudioVisualizer(QMainWindow):
                 name_lower = dev_info['name'].lower()
                 is_wasapi = wasapi_host_api is not None and dev_info['hostApi'] == wasapi_host_api
                 
-                # Priority 1: Explicit loopback devices
-                if dev_info['maxInputChannels'] > 0 and ('stereo mix' in name_lower or 
-                    'wave out' in name_lower or 'loopback' in name_lower or
-                    'what u hear' in name_lower or 'what you hear' in name_lower):
-                    candidates.append((1, i, dev_info, "explicit loopback"))
+                # Priority 0: WASAPI [Loopback] matching default speaker (HIGHEST)
+                # Prefer the default output device's loopback
+                if is_wasapi and '[loopback]' in name_lower and dev_info['maxInputChannels'] > 0:
+                    # Check if this is the default speaker's loopback (prioritize even if multi-channel)
+                    is_default_loopback = False
+                    if default_output_index is not None:
+                        default_name = p.get_device_info_by_index(default_output_index)['name']
+                        loopback_base = dev_info['name'].replace(' [Loopback]', '')
+                        if default_name == loopback_base:
+                            is_default_loopback = True
+                    
+                    # Default speaker loopback always gets priority 0
+                    if is_default_loopback:
+                        candidates.append((0, i, dev_info, f"WASAPI [Loopback] (default speaker, {dev_info['maxInputChannels']}ch)"))
+                    # Other stereo loopbacks get priority 1
+                    elif dev_info['maxInputChannels'] == 2:
+                        candidates.append((1, i, dev_info, "WASAPI [Loopback] (stereo)"))
+                    else:
+                        # Skip non-default multi-channel devices
+                        if self.DEBUG:
+                            print(f"Skipping {dev_info['name']}: {dev_info['maxInputChannels']} channels (not stereo, not default)")
                 
-                # Priority 2: Default WASAPI output device (for loopback capture)
+                # Priority 2: Explicit loopback devices like Stereo Mix
+                elif dev_info['maxInputChannels'] > 0 and ('stereo mix' in name_lower or 
+                    'wave out' in name_lower or 
+                    'what u hear' in name_lower or 'what you hear' in name_lower):
+                    # Exclude [Loopback] devices from this category (already handled above)
+                    if '[loopback]' not in name_lower:
+                        candidates.append((2, i, dev_info, "Stereo Mix"))
+                
+                # Priority 2: Default WASAPI output device (for loopback capture with as_loopback=True)
                 elif is_wasapi and i == default_output_index and dev_info['maxOutputChannels'] > 0:
-                    candidates.append((2, i, dev_info, "default WASAPI output"))
+                    candidates.append((3, i, dev_info, "default WASAPI output"))
                 
                 # Priority 3: Any WASAPI output device (can be used for loopback)
                 elif is_wasapi and dev_info['maxOutputChannels'] > 0:
-                    candidates.append((3, i, dev_info, "WASAPI output"))
+                    candidates.append((4, i, dev_info, "WASAPI output"))
             
             # Sort by priority and select best candidate
             if candidates:
@@ -650,57 +803,91 @@ class AudioVisualizer(QMainWindow):
             
             # Get device capabilities
             device_info = p.get_device_info_by_index(loopback_device_index)
+            device_name = device_info.get('name', '')
             
             # Use device's default sample rate
             default_sample_rate = int(device_info.get('defaultSampleRate', 44100))
+            
+            # Use the device's native sample rate for best compatibility
+            # Don't force resampling - let Windows handle it at the native rate
             sample_rate = default_sample_rate
             
-            # Determine if we're using loopback mode (output device as input)
-            is_output_device = device_info.get('maxOutputChannels', 0) > 0 and device_info.get('maxInputChannels', 0) == 0
-            use_loopback = is_output_device and wasapi_host_api is not None
+            # Check if this is a WASAPI [Loopback] device (already configured for loopback)
+            is_wasapi_loopback = '[Loopback]' in device_name and device_info.get('maxInputChannels', 0) > 0
             
-            # For WASAPI loopback, use output channel count; otherwise use input channels
-            if use_loopback:
-                max_channels = int(device_info.get('maxOutputChannels', 2))
-            else:
+            # For WASAPI [Loopback] devices, they're already configured as input devices
+            # For other output devices, we need to use loopback mode
+            if is_wasapi_loopback:
                 max_channels = int(device_info.get('maxInputChannels', 2))
+                use_loopback = False  # Already in loopback mode
+            else:
+                # Determine if we're using loopback mode (output device as input)
+                is_output_device = device_info.get('maxOutputChannels', 0) > 0 and device_info.get('maxInputChannels', 0) == 0
+                use_loopback = is_output_device and wasapi_host_api is not None
+                
+                # For WASAPI loopback, use output channel count; otherwise use input channels
+                if use_loopback:
+                    max_channels = int(device_info.get('maxOutputChannels', 2))
+                else:
+                    max_channels = int(device_info.get('maxInputChannels', 2))
             
-            # Use device's available channels (prefer stereo but accept mono)
-            if max_channels >= 2:
-                channels = 2  # Use stereo if available
-            elif max_channels == 1:
-                channels = 1  # Use mono if that's all we have
+            # Use device's available channels - capture ALL channels and downmix ourselves
+            # This preserves all audio data instead of discarding channels
+            if max_channels >= 1:
+                channels = max_channels  # Use ALL available channels
             else:
                 channels = 2  # Fallback to stereo
             
             if not self.SILENT:
-                channel_type = "mono" if channels == 1 else "stereo"
-                print(f"Device info: {default_sample_rate}Hz, {channels} channel{'s' if channels > 1 else ''} ({channel_type})")
-                if use_loopback:
+                if max_channels > 2:
+                    print(f"Device info: {default_sample_rate}Hz, {max_channels} channels (will downmix to stereo)")
+                elif max_channels == 2:
+                    print(f"Device info: {default_sample_rate}Hz, 2 channels (stereo)")
+                else:
+                    print(f"Device info: {default_sample_rate}Hz, {channels} channel (mono)")
+                if is_wasapi_loopback:
+                    print("Using WASAPI [Loopback] device (pre-configured for system audio)")
+                elif use_loopback:
                     print("Using WASAPI loopback mode (capturing system audio output)")
                 if self.DEBUG:
                     print(f"Device host API: {device_info['hostApi']}")
-                    print(f"Is output device: {is_output_device}")
+                    print(f"Device name: {device_name}")
             
             # Build stream parameters
+            # Align buffer to ~10ms frames to match common WASAPI periods
+            chunk_frames = max(1, int(sample_rate / 100))
             stream_params = {
                 'format': pyaudio.paInt16,
                 'channels': channels,
                 'rate': sample_rate,
                 'input': True,
                 'input_device_index': loopback_device_index,
-                'frames_per_buffer': self.CHUNK,
+                'frames_per_buffer': chunk_frames,
             }
+            # For pyaudiowpatch + WASAPI output devices, enable loopback capture
+            if using_pyaudiowpatch and use_loopback:
+                stream_params['as_loopback'] = True
             
             if not self.SILENT:
-                print(f"Opening audio stream: {sample_rate}Hz, {channels} channels, chunk={self.CHUNK}")
+                print(f"Opening audio stream: {sample_rate}Hz, {channels} channels, chunk={chunk_frames}")
                 if use_loopback:
                     print("Note: Attempting to use output device for system audio capture")
                     print("This requires either Stereo Mix or a PyAudio build with WASAPI loopback support")
             
-            # Try to open stream
+            # Try to open stream (validate format if possible)
             stream = None
             last_error = None
+            try:
+                # Check format support to catch invalid configurations early
+                if self.DEBUG:
+                    supported = p.is_format_supported(sample_rate,
+                        input_device=loopback_device_index,
+                        input_channels=channels,
+                        input_format=pyaudio.paInt16)
+                    print(f"Format supported: {supported}")
+            except Exception:
+                # Some builds don't implement is_format_supported for WASAPI; continue
+                pass
             
             # Try with current settings
             try:
@@ -768,23 +955,74 @@ class AudioVisualizer(QMainWindow):
                 # Recalculate frequency bins
                 self.freqs = np.fft.rfftfreq(self.FFT_SIZE, 1.0 / self.RATE)
             
-            # Update channels if different
-            if channels != self.CHANNELS:
+            # Update channels - if we're capturing multi-channel, we'll downmix to stereo
+            actual_channels = 2 if channels > 2 else channels
+            if actual_channels != self.CHANNELS:
                 if not self.SILENT:
-                    channel_type = "mono" if channels == 1 else "stereo"
-                    print(f"Note: Using {channels} channel{'s' if channels > 1 else ''} ({channel_type}) instead of requested {self.CHANNELS}")
-                self.CHANNELS = channels
+                    if channels > 2:
+                        print(f"Note: Capturing {channels} channels, downmixing to stereo")
+                    else:
+                        channel_type = "mono" if actual_channels == 1 else "stereo"
+                        print(f"Note: Using {actual_channels} channel{'s' if actual_channels > 1 else ''} ({channel_type}) instead of requested {self.CHANNELS}")
+                self.CHANNELS = actual_channels
             
             if not self.SILENT:
                 print("✓ Audio capture started (Windows WASAPI)")
             
+            if self.DEBUG:
+                print(f"Starting read loop: chunk_frames={chunk_frames}, running={self.running}")
+            
             read_count = 0
+            consecutive_errors = 0
+            last_err_msg = None
+            last_err_time = 0.0
+            suppressed = 0
             
             while self.running:
                 try:
-                    # Read audio chunk
-                    data = stream.read(self.CHUNK, exception_on_overflow=False)
+                    # Read audio chunk with timeout handling
+                    # stream.read() can hang forever on WASAPI if device isn't producing audio
+                    data = stream.read(chunk_frames, exception_on_overflow=False)
+                    
+                    # If we get here, read succeeded
+                    if read_count == 0 and self.DEBUG:
+                        print("✓ First audio chunk read successfully!")
+                    
                     read_count += 1
+                    consecutive_errors = 0
+                    
+                    # Downmix multi-channel audio to stereo if needed
+                    if channels > 2:
+                        # Parse multi-channel data
+                        data_int = np.frombuffer(data, dtype=np.int16)
+                        multi_channel = data_int.reshape(-1, channels)
+                        
+                        # Standard 5.1/7.1 downmix to stereo:
+                        # Front L/R get full weight, center gets 0.707, surround gets 0.707
+                        # This preserves all audio information
+                        if channels == 6:  # 5.1: FL, FR, C, LFE, SL, SR
+                            stereo = np.zeros((len(multi_channel), 2), dtype=np.float32)
+                            stereo[:, 0] = multi_channel[:, 0] + 0.707*multi_channel[:, 2] + 0.707*multi_channel[:, 4]  # Left
+                            stereo[:, 1] = multi_channel[:, 1] + 0.707*multi_channel[:, 2] + 0.707*multi_channel[:, 5]  # Right
+                            # Add LFE to both channels
+                            stereo[:, 0] += 0.5 * multi_channel[:, 3]
+                            stereo[:, 1] += 0.5 * multi_channel[:, 3]
+                        elif channels == 8:  # 7.1: FL, FR, C, LFE, SL, SR, BL, BR
+                            stereo = np.zeros((len(multi_channel), 2), dtype=np.float32)
+                            stereo[:, 0] = multi_channel[:, 0] + 0.707*multi_channel[:, 2] + 0.5*multi_channel[:, 4] + 0.5*multi_channel[:, 6]
+                            stereo[:, 1] = multi_channel[:, 1] + 0.707*multi_channel[:, 2] + 0.5*multi_channel[:, 5] + 0.5*multi_channel[:, 7]
+                            stereo[:, 0] += 0.5 * multi_channel[:, 3]
+                            stereo[:, 1] += 0.5 * multi_channel[:, 3]
+                        else:  # Unknown layout - average all channels
+                            stereo = np.mean(multi_channel.astype(np.float32), axis=1, keepdims=True)
+                            stereo = np.tile(stereo, (1, 2))
+                        
+                        # Clip and convert back to int16
+                        stereo = np.clip(stereo, -32768, 32767).astype(np.int16)
+                        data = stereo.tobytes()
+                        
+                        if read_count == 1 and self.DEBUG:
+                            print(f"Downmixed {channels} channels to stereo using proper surround mixing")
                     
                     # Put data in queue (drop old data if queue is full)
                     if self.audio_queue.full():
@@ -794,14 +1032,58 @@ class AudioVisualizer(QMainWindow):
                             pass
                     self.audio_queue.put(data)
                     
-                    if self.DEBUG and read_count % 100 == 0:
-                        print(f"Audio thread: {read_count} chunks, queue: {self.audio_queue.qsize()}")
+                    if self.DEBUG and read_count % 30 == 1:  # Print every 30 chunks (~0.5s)
+                        data_int = np.frombuffer(data, dtype=np.int16)
+                        rms = np.sqrt(np.mean(data_int.astype(np.float32)**2))
+                        print(f"📊 Audio thread: chunk {read_count}, queue: {self.audio_queue.qsize()}, RMS: {rms:.1f}")
                         
                 except Exception as e:
-                    if self.DEBUG:
-                        print(f"Read error: {e}")
-                    time.sleep(0.001)
-                    continue
+                    consecutive_errors += 1
+                    # Throttle repeated identical errors to avoid CLI flood
+                    msg = f"Read error: {e}"
+                    now = time.perf_counter()
+                    # Only print once every 5s for identical errors; summarize repeats
+                    if last_err_msg == msg and (now - last_err_time) < 5.0:
+                        suppressed += 1
+                    else:
+                        if self.DEBUG and suppressed > 0 and last_err_msg:
+                            print(f"{last_err_msg} (suppressed {suppressed} repeats)")
+                        if self.DEBUG:
+                            print(msg)
+                        last_err_msg = msg
+                        last_err_time = now
+                        suppressed = 0
+                    
+                    # If this is the common WASAPI error (e.g., 0x88890007), back off a bit
+                    err_text = str(e)
+                    if '0x88890007' in err_text or 'AUDCLNT_E' in err_text:
+                        time.sleep(0.02)
+                    else:
+                        time.sleep(0.005)
+                    
+                    # If errors keep happening, try restarting the stream
+                    if consecutive_errors >= 50:
+                        if self.DEBUG:
+                            print("Restarting WASAPI stream due to repeated read errors...")
+                        try:
+                            stream.stop_stream()
+                            stream.close()
+                        except Exception:
+                            pass
+                        try:
+                            stream = p.open(**stream_params)
+                            consecutive_errors = 0
+                            last_err_msg = None
+                            suppressed = 0
+                            last_err_time = 0.0
+                            if self.DEBUG:
+                                print("WASAPI stream restarted successfully")
+                            continue
+                        except Exception as e2:
+                            if self.DEBUG:
+                                print(f"Stream restart failed: {e2}")
+                            time.sleep(0.5)
+                            continue
             
             # Cleanup
             stream.stop_stream()
@@ -1015,14 +1297,15 @@ class AudioVisualizer(QMainWindow):
         """Read audio data and update FFT visualization"""
         frame_start = time.perf_counter()
         
-        # Track timing
-        self.last_viz_time = frame_start
+        # AGGRESSIVE DEBUG
+        if not hasattr(self, '_update_count'):
+            self._update_count = 0
+        self._update_count += 1
         
-        # Debug: count calls to see if timer is misbehaving
-        if not hasattr(self, '_viz_call_count'):
-            self._viz_call_count = 0
-            self._viz_call_start = frame_start
-        self._viz_call_count += 1
+        if self._update_count == 1:
+            print(f"[VIZ] First update called!")
+        if self._update_count % 60 == 0:
+            print(f"[VIZ] Update #{self._update_count}, queue size: {self.audio_queue.qsize()}")
         
         # Profiling timestamps
         prof = {} if self.DEBUG else None
@@ -1041,11 +1324,22 @@ class AudioVisualizer(QMainWindow):
                 except queue.Empty:
                     break
             
+            if self.DEBUG and chunks_processed > 0:
+                print(f"Viz: Processed {chunks_processed} chunks from queue, last data size: {len(last_data)} bytes")
+            elif self.DEBUG and self._update_count == 1:
+                print(f"Viz: First update, queue size: {self.audio_queue.qsize()}")
+            
             if last_data is not None:
                 data = last_data
                 
                 # Convert byte data to numpy array
                 data_int = np.frombuffer(data, dtype=np.int16)
+                
+                # Debug: Check RMS amplitude
+                if self.DEBUG and chunks_processed > 0:
+                    rms = np.sqrt(np.mean(data_int.astype(np.float32)**2))
+                    if chunks_processed % 60 == 0:  # Every ~1 second at 60 FPS
+                        print(f"Audio RMS: {rms:.1f} (max: {np.abs(data_int).max()})")
                 
                 # If stereo, process channels separately for stereo balance
                 if self.CHANNELS == 2:
@@ -1177,19 +1471,11 @@ class AudioVisualizer(QMainWindow):
                         actual_fps = len(self.frame_times) / self.fps_report_interval
                         timer_interval_ms = 1000.0 / self.UPDATE_RATE
                         
-                        # Report call rate vs render rate
-                        call_duration = frame_end - self._viz_call_start
-                        call_rate = self._viz_call_count / call_duration if call_duration > 0 else 0
-                        
-                        print(f"Performance: {fps:.1f} FPS (actual render: {actual_fps:.1f}, calls: {call_rate:.1f}) | Frame time: avg={avg_frame_time_ms:.2f}ms min={min_frame_time:.2f}ms max={max_frame_time:.2f}ms")
+                        print(f"Performance: {fps:.1f} FPS (actual render: {actual_fps:.1f}) | Frame time: avg={avg_frame_time_ms:.2f}ms min={min_frame_time:.2f}ms max={max_frame_time:.2f}ms")
                         print(f"  Target: {self.UPDATE_RATE} FPS ({timer_interval_ms:.2f}ms interval)")
                         if prof:
                             print(f"  Breakdown: audio={prof.get('audio_process', 0)*1000:.2f}ms fft={prof.get('fft_compute', 0)*1000:.2f}ms " +
                                   f"db/smooth={prof.get('db_smooth', 0)*1000:.2f}ms scope={prof.get('oscilloscope', 0)*1000:.2f}ms render={prof.get('render', 0)*1000:.2f}ms")
-                        
-                        # Reset call counter
-                        self._viz_call_count = 0
-                        self._viz_call_start = frame_end
                     self.frame_times.clear()
                 self.last_fps_report = frame_end
                 
