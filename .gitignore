@@ -12,3 +12,6 @@ lib64
 bin
 include
 __pycache__
+*.mp4
+*.m4a
+.gitignore
