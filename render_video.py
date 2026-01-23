@@ -23,7 +23,7 @@ from PyQt5.QtWidgets import QApplication, QWidget
 from PyQt5.QtGui import QImage, QPainter, QColor, QSurfaceFormat
 from PyQt5.QtCore import Qt, QCoreApplication
 
-from audio_visualiser.app import VisualizerCanvas
+from audio_visualizer import VisualizerCanvas
 
 
 class RenderContext:
@@ -44,7 +44,7 @@ class RenderContext:
         self.RANDOM_COLOR = random_color
         self.DEBUG = debug
         self.color_palette = None
-        self.color_palette_oklab = None
+        self.color_palette_lab = None
         self.palette_mode = "rgb"
         self._palette_seed = None
         if random_color:
@@ -220,6 +220,79 @@ def _oklab_to_linear(lab):
     return lms3 @ M2.T
 
 
+# CIELAB (D65) conversion helpers
+_D65_WHITE = np.array([0.95047, 1.00000, 1.08883], dtype=np.float32)
+
+
+def _linear_to_xyz(rgb):
+    M = np.array(
+        [
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041],
+        ],
+        dtype=np.float32,
+    )
+    return rgb @ M.T
+
+
+def _xyz_to_linear(xyz):
+    M = np.array(
+        [
+            [3.2404542, -1.5371385, -0.4985314],
+            [-0.9692660, 1.8760108, 0.0415560],
+            [0.0556434, -0.2040259, 1.0572252],
+        ],
+        dtype=np.float32,
+    )
+    return xyz @ M.T
+
+
+def _xyz_to_lab(xyz):
+    xyz = xyz / _D65_WHITE
+    delta = 6.0 / 29.0
+    delta3 = delta ** 3
+    f = np.where(xyz > delta3, np.cbrt(xyz), (xyz / (3 * delta ** 2)) + 4.0 / 29.0)
+    L = (116.0 * f[..., 1]) - 16.0
+    a = 500.0 * (f[..., 0] - f[..., 1])
+    b = 200.0 * (f[..., 1] - f[..., 2])
+    return np.stack([L, a, b], axis=-1)
+
+
+def _lab_to_xyz(lab):
+    L = lab[..., 0]
+    a = lab[..., 1]
+    b = lab[..., 2]
+    fy = (L + 16.0) / 116.0
+    fx = fy + (a / 500.0)
+    fz = fy - (b / 200.0)
+    delta = 6.0 / 29.0
+    fx3 = fx ** 3
+    fy3 = fy ** 3
+    fz3 = fz ** 3
+    xr = np.where(fx3 > delta ** 3, fx3, (fx - 4.0 / 29.0) * (3 * delta ** 2))
+    yr = np.where(fy3 > delta ** 3, fy3, (fy - 4.0 / 29.0) * (3 * delta ** 2))
+    zr = np.where(fz3 > delta ** 3, fz3, (fz - 4.0 / 29.0) * (3 * delta ** 2))
+    xyz = np.stack([xr, yr, zr], axis=-1) * _D65_WHITE
+    return xyz
+
+
+def _srgb_to_lab(srgb):
+    linear = _srgb_to_linear(srgb)
+    xyz = _linear_to_xyz(linear)
+    return _xyz_to_lab(xyz)
+
+
+def _lab_to_srgb(lab):
+    xyz = _lab_to_xyz(lab)
+    linear = _xyz_to_linear(xyz)
+    return _linear_to_srgb(linear)
+
+
+def _delta_e(lab1, lab2):
+    return float(np.linalg.norm(lab1 - lab2))
+
+
 def _fallback_oklab_palette_from_rgb(center_rgb, axis=None):
     srgb = np.array(center_rgb, dtype=np.float32) / 255.0
     linear = _srgb_to_linear(srgb)
@@ -250,6 +323,249 @@ def _fallback_oklab_palette_from_rgb(center_rgb, axis=None):
     center = np.array([base_L, center_ab[0], center_ab[1]], dtype=np.float32)
     right = np.array([base_L, right_ab[0], right_ab[1]], dtype=np.float32)
     return [left, center, right]
+
+
+class _LabPaletteState:
+    def __init__(self):
+        self.prev_clusters = None
+        self.prev_palette = None
+        self.prev_bg_mean = None
+
+    def reset(self):
+        self.prev_clusters = None
+        self.prev_palette = None
+        self.prev_bg_mean = None
+
+
+def _box_blur_rgb(arr, k=3):
+    if k <= 1:
+        return arr
+    blurred = np.empty_like(arr)
+    for c in range(3):
+        blurred[:, :, c] = _local_mean(arr[:, :, c], k=k)
+    return blurred
+
+
+def _prepare_analysis_frame(frame_rgb, sample_step=4, blur_k=3):
+    step = max(1, int(sample_step))
+    small = frame_rgb[::step, ::step, :]
+    if blur_k and blur_k > 1:
+        small = _box_blur_rgb(small, k=int(blur_k))
+    return small
+
+
+def _lab_histogram_masses(lab, bins=(12, 12, 12), min_count=40, merge_delta=6.0):
+    L_bins, a_bins, b_bins = bins
+    L_range = (0.0, 100.0)
+    a_range = (-128.0, 127.0)
+    b_range = (-128.0, 127.0)
+    hist, edges = np.histogramdd(
+        lab.reshape(-1, 3),
+        bins=[L_bins, a_bins, b_bins],
+        range=[L_range, a_range, b_range],
+    )
+    idxs = np.argwhere(hist >= min_count)
+    if idxs.size == 0:
+        return []
+
+    centers = []
+    weights = []
+    for idx in idxs:
+        l_idx, a_idx, b_idx = idx
+        l0, l1 = edges[0][l_idx], edges[0][l_idx + 1]
+        a0, a1 = edges[1][a_idx], edges[1][a_idx + 1]
+        b0, b1 = edges[2][b_idx], edges[2][b_idx + 1]
+        center = np.array([(l0 + l1) * 0.5, (a0 + a1) * 0.5, (b0 + b1) * 0.5], dtype=np.float32)
+        centers.append(center)
+        weights.append(float(hist[tuple(idx)]))
+
+    centers = np.array(centers, dtype=np.float32)
+    weights = np.array(weights, dtype=np.float32)
+    order = np.argsort(weights)[::-1]
+
+    taken = np.zeros(len(centers), dtype=bool)
+    merged = []
+    merged_w = []
+    for i in order:
+        if taken[i]:
+            continue
+        mask = ~taken
+        dists = np.linalg.norm(centers[mask] - centers[i], axis=1)
+        idxs_mask = np.where(mask)[0]
+        close = idxs_mask[dists <= merge_delta]
+        if close.size == 0:
+            close = np.array([i])
+        w = weights[close]
+        c = np.average(centers[close], axis=0, weights=w)
+        merged.append(c)
+        merged_w.append(float(np.sum(w)))
+        taken[close] = True
+
+    return list(zip(merged, merged_w))
+
+
+def _init_kmeans_centroids(points, weights, k):
+    order = np.argsort(weights)[::-1]
+    centroids = [points[order[0]]]
+    while len(centroids) < k:
+        d2 = np.min([np.sum((points - c) ** 2, axis=1) for c in centroids], axis=0)
+        idx = int(np.argmax(d2))
+        centroids.append(points[idx])
+    return np.array(centroids, dtype=np.float32)
+
+
+def _cluster_masses(masses, k=5, iters=10):
+    if not masses:
+        return []
+    points = np.array([m[0] for m in masses], dtype=np.float32)
+    weights = np.array([m[1] for m in masses], dtype=np.float32)
+    k = min(max(int(k), 1), len(points))
+    centroids = _init_kmeans_centroids(points, weights, k)
+    for _ in range(iters):
+        dists = np.linalg.norm(points[:, None, :] - centroids[None, :, :], axis=2)
+        labels = np.argmin(dists, axis=1)
+        new_centroids = []
+        new_weights = []
+        for ci in range(k):
+            mask = labels == ci
+            if not np.any(mask):
+                new_centroids.append(centroids[ci])
+                new_weights.append(0.0)
+                continue
+            w = weights[mask]
+            c = np.average(points[mask], axis=0, weights=w)
+            new_centroids.append(c)
+            new_weights.append(float(np.sum(w)))
+        centroids = np.array(new_centroids, dtype=np.float32)
+        weights_k = np.array(new_weights, dtype=np.float32)
+    clusters = []
+    for ci in range(k):
+        clusters.append({"lab": centroids[ci], "weight": float(weights_k[ci])})
+    return clusters
+
+
+def _reject_low_contrast(clusters, bg_mean, threshold=8.0):
+    kept = []
+    for c in clusters:
+        if _delta_e(c["lab"], bg_mean) >= threshold:
+            kept.append(c)
+    return kept
+
+
+def _score_clusters(clusters, bg_mean):
+    if not clusters:
+        return []
+    total_w = sum(c["weight"] for c in clusters) + 1e-6
+    labs = [c["lab"] for c in clusters]
+    scored = []
+    for i, c in enumerate(clusters):
+        w_norm = c["weight"] / total_w
+        lab = c["lab"]
+        chroma = float(np.sqrt(lab[1] ** 2 + lab[2] ** 2))
+        contrast_bg = _delta_e(lab, bg_mean)
+        if len(labs) > 1:
+            min_sep = min(_delta_e(lab, other) for j, other in enumerate(labs) if j != i)
+        else:
+            min_sep = contrast_bg
+        score = w_norm * (1.0 + chroma / 60.0) * (1.0 + contrast_bg / 25.0) * (1.0 + min_sep / 25.0)
+        scored.append({"lab": lab, "weight": c["weight"], "score": score})
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored
+
+
+def _stabilize_clusters(scored_clusters, state, alpha):
+    if not scored_clusters:
+        return []
+    if state.prev_clusters is None:
+        state.prev_clusters = [c["lab"].copy() for c in scored_clusters]
+        return scored_clusters
+
+    prev = state.prev_clusters
+    stabilized = []
+    for c in scored_clusters:
+        lab = c["lab"]
+        dists = [np.linalg.norm(lab - p) for p in prev]
+        match = prev[int(np.argmin(dists))]
+        blended = (1 - alpha) * match + alpha * lab
+        stabilized.append({"lab": blended, "weight": c["weight"], "score": c["score"]})
+
+    state.prev_clusters = [c["lab"].copy() for c in stabilized]
+    return stabilized
+
+
+def _select_three(scored_clusters, min_delta=12.0):
+    selected = []
+    for c in scored_clusters:
+        if not selected:
+            selected.append(c)
+            continue
+        if all(_delta_e(c["lab"], s["lab"]) >= min_delta for s in selected):
+            selected.append(c)
+        if len(selected) == 3:
+            break
+    return selected
+
+
+def _assign_roles_lab(labs):
+    if len(labs) != 3:
+        return None
+    labs_sorted = sorted(labs, key=lambda x: x[0])
+    center = max(labs_sorted, key=lambda x: x[0])
+    others = [l for l in labs if not np.allclose(l, center)]
+    if len(others) < 2:
+        return None
+    left, right = others[0], others[1]
+    if left[1] > right[1]:
+        left, right = right, left
+    return [left, center, right]
+
+
+def _fallback_palette_lab(bg_mean, prev_palette=None):
+    if prev_palette is not None and len(prev_palette) == 3:
+        return prev_palette
+    L, a, b = bg_mean
+    base_L = float(np.clip(L, 20.0, 85.0))
+    offset = 18.0
+    left = np.array([base_L, a - offset, b], dtype=np.float32)
+    center = np.array([base_L, a * 0.4, b * 0.4], dtype=np.float32)
+    right = np.array([base_L, a + offset, b], dtype=np.float32)
+    return [left, center, right]
+
+
+def _extract_lab_palette(frame_rgb, state, sample_step=4, smooth_strength=10):
+    small = _prepare_analysis_frame(frame_rgb, sample_step=sample_step, blur_k=3)
+    if small.size == 0:
+        return None, None
+
+    srgb = small.astype(np.float32) / 255.0
+    lab = _srgb_to_lab(srgb)
+    L = lab[:, :, 0]
+    bg_mean = np.mean(lab.reshape(-1, 3), axis=0)
+    state.prev_bg_mean = bg_mean
+
+    masses = _lab_histogram_masses(lab, bins=(12, 12, 12), min_count=40, merge_delta=6.0)
+    if not masses:
+        return None, float(np.mean(L) / 100.0)
+
+    clusters = _cluster_masses(masses, k=6, iters=8)
+    clusters = _reject_low_contrast(clusters, bg_mean, threshold=8.0)
+    if not clusters:
+        return None, float(np.mean(L) / 100.0)
+
+    scored = _score_clusters(clusters, bg_mean)
+    alpha = 1.0 / max(1.0, float(smooth_strength))
+    scored = _stabilize_clusters(scored, state, alpha=alpha)
+    selected = _select_three(scored, min_delta=12.0)
+    if len(selected) < 3:
+        return None, float(np.mean(L) / 100.0)
+
+    labs = [c["lab"] for c in selected]
+    palette = _assign_roles_lab(labs)
+    if palette is None:
+        return None, float(np.mean(L) / 100.0)
+
+    state.prev_palette = palette
+    return palette, float(np.mean(L) / 100.0)
 
 
 def _local_mean(arr, k=3):
@@ -686,7 +1002,17 @@ def render_video(
         freqs = np.fft.rfftfreq(fft_size, 1.0 / rate)
         hamming = np.hamming(fft_size).astype(np.float32)
         window_correction = np.sqrt(fft_size / np.sum(hamming**2))
-        iso226_freqs, iso226_boost = compute_iso226_boost()
+        norm_factor = fft_size * 32768.0
+        use_hearing_bias = (not happy_mode) and (human_bias > 0)
+        if use_hearing_bias:
+            iso226_freqs, iso226_boost = compute_iso226_boost()
+            hearing_correction = np.interp(
+                freqs,
+                iso226_freqs,
+                iso226_boost,
+                left=iso226_boost[0],
+                right=iso226_boost[-1],
+            )
 
         # State for smoothing
         fft_db_state = np.full(fft_size // 2 + 1, -80.0, dtype=np.float32)
@@ -727,17 +1053,18 @@ def render_video(
         if background_video:
             canvas.minimal_overlay = True
             parent_ctx.RANDOM_COLOR = True
-            parent_ctx.palette_mode = "oklab"
+            parent_ctx.palette_mode = "lab"
             # Initialize with a neutral palette until first frame
             parent_ctx.color_palette = None
-            parent_ctx.color_palette_oklab = None
+            parent_ctx.color_palette_lab = None
             parent_ctx._palette_seed = None
 
         # Prepare background video decoder (optional)
         bg_process = None
         bg_frame_size = width * height * 3
         bg_luma_smoothed = None
-        palette_state = _HeroColorState()
+        palette_state = _LabPaletteState()
+        solid_bg_image = None
 
         if background_video:
             if not os.path.isfile(background_video):
@@ -816,6 +1143,9 @@ def render_video(
         samples_per_frame = int(rate / fps)
         oscilloscope_samples = 1024
 
+        viz_image = QImage(width, height, QImage.Format_ARGB32)
+        composite_image = QImage(width, height, QImage.Format_RGB32)
+
         for frame_idx in range(total_frames):
             end = min(total_samples, (frame_idx + 1) * samples_per_frame)
             start = end - fft_size
@@ -850,23 +1180,15 @@ def render_video(
                 FR = np.fft.rfft(windowed_right)
                 ML = np.abs(FL)
                 MR = np.abs(FR)
-                fft_magnitude = np.sqrt(ML**2 + MR**2) * window_correction
+                fft_magnitude = np.hypot(ML, MR) * window_correction
 
                 sum_mag = MR + ML + 1e-6
                 stereo_balance = np.clip((MR - ML) / sum_mag, -1.0, 1.0)
 
-            norm_factor = fft_size * 32768.0
             fft_db = 20 * np.log10(fft_magnitude / norm_factor + 1e-10)
 
             if not happy_mode:
-                if human_bias > 0:
-                    hearing_correction = np.interp(
-                        freqs,
-                        iso226_freqs,
-                        iso226_boost,
-                        left=iso226_boost[0],
-                        right=iso226_boost[-1],
-                    )
+                if use_hearing_bias:
                     # Apply equal-loudness weighting: attenuate lows/highs vs 1 kHz
                     fft_db -= hearing_correction * human_bias
                 fft_db = np.clip(fft_db, -80, 0)
@@ -905,49 +1227,37 @@ def render_video(
                     try:
                         arr = np.frombuffer(bg_bytes, dtype=np.uint8)
                         arr = arr.reshape((height, width, 3))
-                        step = max(1, int(bg_color_sample_step))
-                        sample = arr[::step, ::step, :]
-                        luma = (
-                            0.2126 * sample[:, :, 0]
-                            + 0.7152 * sample[:, :, 1]
-                            + 0.0722 * sample[:, :, 2]
-                        ).mean() / 255.0
-
-                        # Primary palette (OKLab saliency pipeline)
-                        palette_oklab, _ = _extract_oklab_palette(
-                            sample,
+                        palette_lab, luma = _extract_lab_palette(
+                            arr,
                             palette_state,
-                            sample_step=1,
+                            sample_step=bg_color_sample_step,
                             smooth_strength=bg_color_smooth,
                         )
                     except Exception:
                         luma = 0.5
-                        palette_oklab = None
+                        palette_lab = None
 
-                    if palette_oklab is None:
-                        if palette_state.prev_palette is not None:
-                            palette_oklab = palette_state.prev_palette
-                        else:
-                            mean_rgb = sample.mean(axis=(0, 1)) if "sample" in locals() else np.array([96, 96, 112])
-                            palette_oklab = _fallback_oklab_palette_from_rgb(
-                                mean_rgb,
-                                axis=palette_state.prev_axis,
-                            )
+                    if palette_lab is None:
+                        mean_rgb = arr.mean(axis=(0, 1)) if "arr" in locals() else np.array([96, 96, 112])
+                        bg_mean_lab = _srgb_to_lab(mean_rgb.astype(np.float32) / 255.0)
+                        palette_lab = _fallback_palette_lab(
+                            bg_mean_lab,
+                            prev_palette=palette_state.prev_palette,
+                        )
 
                     if bg_luma_smoothed is None:
                         bg_luma_smoothed = luma
                     else:
                         bg_luma_smoothed = 0.9 * bg_luma_smoothed + 0.1 * luma
 
-                    if palette_oklab is not None:
+                    if palette_lab is not None:
                         rgb_palette = []
-                        for lab in palette_oklab:
-                            linear = _oklab_to_linear(lab)
-                            srgb = _linear_to_srgb(linear)
+                        for lab in palette_lab:
+                            srgb = _lab_to_srgb(lab)
                             rgb = np.clip(srgb * 255.0, 0, 255).astype(np.int32)
                             rgb_palette.append((int(rgb[0]), int(rgb[1]), int(rgb[2])))
                         parent_ctx.color_palette = rgb_palette
-                        parent_ctx.color_palette_oklab = palette_oklab
+                        parent_ctx.color_palette_lab = palette_lab
 
                     # Invalidate caches to reflect new palette
                     canvas.cached_colors.clear()
@@ -957,19 +1267,20 @@ def render_video(
                     bg_image = QImage(width, height, QImage.Format_RGB32)
                     bg_image.fill(QColor(20, 20, 30))
             else:
-                bg_image = QImage(width, height, QImage.Format_RGB32)
-                bg_image.fill(QColor(20, 20, 30))
+                if solid_bg_image is None:
+                    solid_bg_image = QImage(width, height, QImage.Format_RGB32)
+                    solid_bg_image.fill(QColor(20, 20, 30))
+                bg_image = solid_bg_image
 
             # Render visualizer onto transparent surface
-            viz_image = QImage(width, height, QImage.Format_ARGB32)
             viz_image.fill(QColor(0, 0, 0, 0))
             viz_painter = QPainter(viz_image)
             canvas.render(viz_painter)
             viz_painter.end()
 
             # Composite background + visualizer with adaptive opacity
-            image = QImage(width, height, QImage.Format_RGB32)
-            painter = QPainter(image)
+            composite_image.fill(QColor(0, 0, 0))
+            painter = QPainter(composite_image)
             painter.drawImage(0, 0, bg_image)
 
             adaptive_factor = 1.0
@@ -982,7 +1293,7 @@ def render_video(
             painter.drawImage(0, 0, viz_image)
             painter.end()
 
-            image_rgb = image.convertToFormat(QImage.Format_RGB888)
+            image_rgb = composite_image.convertToFormat(QImage.Format_RGB888)
             ptr = image_rgb.bits()
             ptr.setsize(image_rgb.byteCount())
             process.stdin.write(ptr)
@@ -1015,6 +1326,12 @@ def main():
     parser.add_argument("--width", type=int, default=1920, help="Video width")
     parser.add_argument("--height", type=int, default=1080, help="Video height")
     parser.add_argument("--fps", type=int, default=60, help="Frames per second")
+    parser.add_argument(
+        "--update-rate",
+        type=int,
+        default=None,
+        help="Visualizer update rate in Hz (alias for --fps in offline render).",
+    )
     parser.add_argument("--buffer-size", type=int, default=2048, help="FFT buffer size")
     parser.add_argument("--chunk-size", type=int, default=512, help="Chunk size (unused for offline render)")
     parser.add_argument(
@@ -1098,6 +1415,8 @@ def main():
         parser.error("--buffer-size must be between 512 and 32768")
     if args.fps < 1 or args.fps > 240:
         parser.error("--fps must be between 1 and 240")
+    if args.update_rate is not None and (args.update_rate < 1 or args.update_rate > 240):
+        parser.error("--update-rate must be between 1 and 240")
     if args.viz_opacity < 0 or args.viz_opacity > 1:
         parser.error("--viz-opacity must be between 0 and 1")
     if args.bg_color_smooth < 1 or args.bg_color_smooth > 120:
@@ -1105,12 +1424,16 @@ def main():
     if args.bg_color_sample_step < 1 or args.bg_color_sample_step > 64:
         parser.error("--bg-color-sample-step must be between 1 and 64")
 
+    resolved_fps = args.fps
+    if args.update_rate is not None:
+        resolved_fps = args.update_rate
+
     render_video(
         input_audio=args.audio,
         output_path=args.output,
         width=args.width,
         height=args.height,
-        fps=args.fps,
+        fps=resolved_fps,
         fft_size=args.buffer_size,
         chunk_size=args.chunk_size,
         human_bias=args.human_bias,
