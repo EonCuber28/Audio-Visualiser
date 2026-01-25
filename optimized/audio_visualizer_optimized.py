@@ -6,7 +6,9 @@ Supports: Linux (PulseAudio/PipeWire), Windows 10/11 (WASAPI Loopback)
 """
 
 import sys
+import os
 import numpy as np
+import builtins
 
 # NumPy 2.x compatibility: add fromstring shim BEFORE any other imports
 # This must be done early so soundcard can use it
@@ -101,6 +103,34 @@ except ImportError:
     HAS_SCIPY = False
 
 
+# Module-wide print wrapper that respects --silent and --debug flags.
+# We shadow the module-level name `print` so all subsequent unqualified
+# calls to `print()` in this module go through our wrapper. Use
+# `_set_print_flags(silent, debug)` to update behavior from the
+# `AudioVisualizer` constructor.
+_ORIG_PRINT = builtins.print
+_GLOBAL_SILENT = False
+_GLOBAL_DEBUG = False
+
+def _set_print_flags(silent, debug):
+    global _GLOBAL_SILENT, _GLOBAL_DEBUG
+    _GLOBAL_SILENT = bool(silent)
+    _GLOBAL_DEBUG = bool(debug)
+
+def print(*args, debug_only=False, force=False, **kwargs):
+    """Module-local print wrapper.
+
+    - If `force=True`, always prints (bypasses silent).
+    - If `debug_only=True`, prints only when `_GLOBAL_DEBUG` is True.
+    - Otherwise prints unless `_GLOBAL_SILENT` is True.
+    """
+    if _GLOBAL_SILENT and not force:
+        return
+    if debug_only and not _GLOBAL_DEBUG:
+        return
+    return _ORIG_PRINT(*args, **kwargs)
+
+
 # ===== Settings persistence (cross-platform) =====
 def get_config_dir():
     """Get platform-appropriate config directory for settings persistence"""
@@ -156,6 +186,10 @@ class AudioVisualizer(QMainWindow):
     
     def __init__(self, chunk_size=1024, buffer_size=8192, update_rate=60, human_bias=0.5, silent=False, debug=False, happy_mode=False, random_color=False, color_seed=None, num_bars=None, device_id=None, device_name=None):
         super().__init__()
+        # Initialize module-level print flags early so any subsequent
+        # prints (including those in load_settings()) respect the
+        # --silent and --debug command-line flags.
+        _set_print_flags(silent, debug)
         self.setWindowTitle("Autisum Frequency Visualizer")
         self.setGeometry(100, 100, 1200, 600)
         self.user_num_bars = num_bars  # User-specified bar count (None = auto)
@@ -277,6 +311,8 @@ class AudioVisualizer(QMainWindow):
         # Oscilloscope waveform buffer (store recent samples for display)
         self.oscilloscope_samples = 1024  # Number of samples to display (reduced for performance)
         self.waveform_buffer = np.zeros(self.oscilloscope_samples, dtype=np.float32)
+        # Per-platform oscilloscope gain (increase on Linux where levels are lower)
+        self.oscilloscope_gain = 2.5 if IS_LINUX else 1.0
         
         # Audio buffer queue
         self.audio_queue = queue.Queue(maxsize=3)  # Smaller queue to minimize latency
@@ -1435,9 +1471,8 @@ class AudioVisualizer(QMainWindow):
                 '--latency-msec=1',
                 '--raw'  # Use raw output
             ]
-            
-            if not self.SILENT:
-                print(f"Starting parec with command: {' '.join(cmd)}")
+            print(f"[AUDIO_CAPTURE] Will run: {' '.join(cmd)}")
+            print(f"[AUDIO_CAPTURE] Requested CHANNELS={self.CHANNELS}, RATE={self.RATE}")
             
             process = subprocess.Popen(
                 cmd,
@@ -1565,37 +1600,64 @@ class AudioVisualizer(QMainWindow):
                 print(f"Viz: First update, queue size: {self.audio_queue.qsize()}")
             
             if data is not None:
-                
+                print(f"[AUDIO] Got data from queue: {len(data)} bytes, CHANNELS={self.CHANNELS}")
                 # Convert byte data to numpy array
                 data_int = np.frombuffer(data, dtype=np.int16)
-                
+                print(f"[AUDIO] data_int.shape={data_int.shape}, dtype={data_int.dtype}, min={data_int.min()}, max={data_int.max()}")
                 # Debug: Check RMS amplitude
-                if self.DEBUG and self._update_count % 60 == 0:
+                if self.DEBUG or True:
                     rms = np.sqrt(np.mean(data_int.astype(np.float32)**2))
-                    print(f"Audio RMS: {rms:.1f} (max: {np.abs(data_int).max()})")
-                
-                # If stereo, process channels separately for stereo balance
-                if self.CHANNELS == 2:
-                    data_stereo = data_int.reshape(-1, 2)
-                    data_left = data_stereo[:, 0]
-                    data_right = data_stereo[:, 1]
-                    data_float = (data_left.astype(np.float32) + data_right.astype(np.float32)) * 0.5
-                    
-                    # Shift buffers using slicing (much faster than np.roll)
-                    shift = len(data_left)
-                    self.audio_buffer_left[:-shift] = self.audio_buffer_left[shift:]
-                    self.audio_buffer_left[-shift:] = data_left
-                    self.audio_buffer_right[:-shift] = self.audio_buffer_right[shift:]
-                    self.audio_buffer_right[-shift:] = data_right
+                    print(f"[AUDIO] RMS: {rms:.1f} (max: {np.abs(data_int).max()})")
+                # Infer actual channel count from the received data (defensive)
+                channels_used = self.CHANNELS
+                # If the data length doesn't match expected per self.CHANNELS, try to infer
+                if data_int.size == self.CHUNK * self.CHANNELS:
+                    channels_used = self.CHANNELS
+                elif data_int.size == self.CHUNK * 1:
+                    channels_used = 1
+                elif data_int.size == self.CHUNK * 2:
+                    channels_used = 2
                 else:
-                    # Mono: convert to float
+                    # Try to infer by dividing by CHUNK (if CHUNK matches frames)
+                    inferred = data_int.size // self.CHUNK if self.CHUNK > 0 else 0
+                    if inferred in (1, 2):
+                        channels_used = inferred
+                    else:
+                        # Fallback: if data length is even, prefer stereo for processing convenience
+                        channels_used = 2 if data_int.size % 2 == 0 else 1
+                if channels_used != self.CHANNELS:
+                    print(f"[AUDIO] WARNING: expected {self.CHANNELS} channels but inferred {channels_used} channels for this chunk (data_int.size={data_int.size}). Using {channels_used} for processing this frame.")
+
+                if channels_used == 2:
+                    # Defensive: only reshape if data length is even and compatible
+                    if data_int.size % 2 == 0:
+                        data_stereo = data_int.reshape(-1, 2)
+                        print(f"[AUDIO] data_stereo.shape={data_stereo.shape}")
+                        data_left = data_stereo[:, 0]
+                        data_right = data_stereo[:, 1]
+                        print(f"[AUDIO] data_left[0:5]={data_left[:5]}, data_right[0:5]={data_right[:5]}")
+                        data_float = (data_left.astype(np.float32) + data_right.astype(np.float32)) * 0.5
+                        # Shift buffers using slicing (much faster than np.roll)
+                        shift = len(data_left)
+                        print(f"[AUDIO] Shifting audio_buffer_left/right by {shift}")
+                        self.audio_buffer_left[:-shift] = self.audio_buffer_left[shift:]
+                        self.audio_buffer_left[-shift:] = data_left
+                        self.audio_buffer_right[:-shift] = self.audio_buffer_right[shift:]
+                        self.audio_buffer_right[-shift:] = data_right
+                        print(f"[AUDIO] audio_buffer_left shape: {self.audio_buffer_left.shape}, audio_buffer_right shape: {self.audio_buffer_right.shape}")
+                    else:
+                        print(f"[AUDIO] Stereo expected but data_int.size % 2 != 0, treating as mono")
+                        data_float = data_int.astype(np.float32)
+                else:
+                    print(f"[AUDIO] Mono processing (channels_used={channels_used})")
                     data_float = data_int.astype(np.float32)
-                
                 # Shift the main buffer using slicing (much faster than np.roll)
                 shift = len(data_float)
+                print(f"[AUDIO] Shifting audio_buffer by {shift}")
                 self.audio_buffer[:-shift] = self.audio_buffer[shift:]
                 self.audio_buffer[-shift:] = data_float
-                
+                # Record which channel count was used for this frame (for FFT stage)
+                self._last_channels_used = channels_used
                 data_processed = True
             
             if self.DEBUG and prof is not None:
@@ -1603,7 +1665,9 @@ class AudioVisualizer(QMainWindow):
             
             if data_processed:
                 # Step 2 & 3: Window and FFT per channel (use pre-computed window)
-                if self.CHANNELS == 2:
+                channels_for_fft = getattr(self, '_last_channels_used', self.CHANNELS)
+                print(f"[FFT] Using {channels_for_fft} channel(s) for FFT computation")
+                if channels_for_fft == 2:
                     windowed_left = self.audio_buffer_left * self.hamming_window
                     windowed_right = self.audio_buffer_right * self.hamming_window
                     
@@ -1618,6 +1682,14 @@ class AudioVisualizer(QMainWindow):
                     # Step 8: Stereo balance per bin
                     sum_mag = MR + ML + 1e-6
                     self.stereo_balance = np.clip((MR - ML) / sum_mag, -1.0, 1.0)
+                    # Smooth stereo balance over time for stable color transitions
+                    alpha_balance = 0.25
+                    # Ensure smoothed buffer exists and matches length
+                    if not hasattr(self, 'stereo_balance_smoothed') or self.stereo_balance_smoothed.shape != self.stereo_balance.shape:
+                        self.stereo_balance_smoothed = self.stereo_balance.copy()
+                    else:
+                        self.stereo_balance_smoothed = (alpha_balance * self.stereo_balance +
+                                                        (1.0 - alpha_balance) * self.stereo_balance_smoothed)
                 else:
                     # Mono: just compute FFT
                     windowed_data = self.audio_buffer * self.hamming_window
@@ -1679,12 +1751,17 @@ class AudioVisualizer(QMainWindow):
             if data_processed and hasattr(self, '_frame_counter'):
                 if self._frame_counter % 2 == 0:  # Only update every 2nd frame
                     recent_samples = self.audio_buffer[-self.oscilloscope_samples:].copy()
-                    self.waveform_buffer = recent_samples / 32768.0
+                    normalized = recent_samples / 32768.0
+                    # Apply platform-specific oscilloscope gain and clip
+                    normalized = np.clip(normalized * self.oscilloscope_gain, -1.0, 1.0)
+                    self.waveform_buffer = normalized.astype(np.float32)
                 self._frame_counter += 1
             elif data_processed:
                 self._frame_counter = 0
                 recent_samples = self.audio_buffer[-self.oscilloscope_samples:].copy()
-                self.waveform_buffer = recent_samples / 32768.0
+                normalized = recent_samples / 32768.0
+                normalized = np.clip(normalized * self.oscilloscope_gain, -1.0, 1.0)
+                self.waveform_buffer = normalized.astype(np.float32)
             
             if self.DEBUG and prof is not None:
                 prof['oscilloscope'] = time.perf_counter() - frame_start - prof.get('db_smooth', 0) - prof.get('fft_compute', 0) - prof.get('audio_process', 0)
@@ -1728,6 +1805,80 @@ class AudioVisualizer(QMainWindow):
                 import traceback
                 traceback.print_exc()
     
+    def run_audio_diagnostics(self, duration=5, out_file='/tmp/aVis_diagnostics.log'):
+        """Run a short audio capture diagnostic: read raw chunks from audio_queue and log details."""
+        start = time.time()
+        chunks = []
+        inferred_channels = {}
+        total_bytes = 0
+        print(f"[DIAG] Starting audio diagnostics for {duration}s, logging to {out_file}")
+        with open(out_file, 'w') as fh:
+            fh.write(f"Audio diagnostics - start={time.ctime()}\n")
+            fh.write(f"Requested CHANNELS={self.CHANNELS}, CHUNK={self.CHUNK}, RATE={self.RATE}\n")
+            while time.time() - start < duration:
+                try:
+                    data = self.audio_queue.get(timeout=0.5)
+                except queue.Empty:
+                    fh.write("[DIAG] queue empty - no data available in this interval\n")
+                    continue
+                if not data:
+                    fh.write("[DIAG] got empty chunk\n")
+                    continue
+                total_bytes += len(data)
+                data_int = np.frombuffer(data, dtype=np.int16)
+                # Infer channels
+                ch = None
+                if self.CHUNK > 0 and data_int.size % self.CHUNK == 0:
+                    frames = data_int.size // self.CHUNK
+                    if frames in (1,2):
+                        ch = frames
+                if ch is None:
+                    ch = 2 if data_int.size % 2 == 0 else 1
+                inferred_channels[ch] = inferred_channels.get(ch, 0) + 1
+                rms = float(np.sqrt(np.mean(data_int.astype(np.float32)**2))) if data_int.size>0 else 0.0
+                fh.write(f"[DIAG] chunk_bytes={len(data)}, data_int.size={data_int.size}, inferred_ch={ch}, rms={rms:.2f}\n")
+                if data_int.size >= 8:
+                    fh.write(f"[DIAG] samples(0:8)={data_int[:8].tolist()}\n")
+                chunks.append((len(data), data_int.shape))
+            fh.write(f"[DIAG] finished - total_chunks={len(chunks)}, total_bytes={total_bytes}\n")
+            fh.write(f"[DIAG] inferred_channels_summary={inferred_channels}\n")
+            fh.write(f"Audio diagnostics - end={time.ctime()}\n")
+        print(f"[DIAG] Wrote diagnostics to {out_file}")
+        # After diagnostics, attempt graceful shutdown of worker threads and Qt
+        print("[DIAG] Exiting after diagnostics - attempting graceful shutdown")
+        # Signal threads to stop
+        try:
+            self.viz_running = False
+            self.running = False
+        except Exception:
+            pass
+        # Drain queue to avoid blocking
+        try:
+            while not self.audio_queue.empty():
+                self.audio_queue.get_nowait()
+        except Exception:
+            pass
+        # Join threads briefly
+        try:
+            if hasattr(self, 'audio_thread') and getattr(self, 'audio_thread') is not None and self.audio_thread.is_alive():
+                self.audio_thread.join(timeout=1.0)
+            if hasattr(self, 'viz_thread') and getattr(self, 'viz_thread') is not None and self.viz_thread.is_alive():
+                self.viz_thread.join(timeout=1.0)
+        except Exception:
+            pass
+        # Close the window and quit Qt event loop if running
+        try:
+            self.close()
+        except Exception:
+            pass
+        try:
+            from PyQt5.QtWidgets import QApplication
+            QApplication.quit()
+        except Exception:
+            pass
+        # Finally, exit
+        raise SystemExit(0)
+    
     def _visualization_loop(self):
         """Thread loop that calls update_visualization at precise intervals"""
         next_frame_time = time.perf_counter()
@@ -1770,15 +1921,25 @@ class AudioVisualizer(QMainWindow):
     
     def open_settings_dialog(self):
         """Open the settings dialog (modeless - doesn't block)"""
-        if not hasattr(self, 'settings_dialog') or self.settings_dialog is None:
-            self.settings_dialog = SettingsDialog(self, self)
-            # Connect signal for settings updates
-            self.settings_dialog.settings_applied.connect(self.apply_settings)
-            self.settings_dialog.show()
-        else:
-            # Bring existing dialog to front
-            self.settings_dialog.raise_()
-            self.settings_dialog.activateWindow()
+        from PyQt5.QtCore import QTimer
+        def show_dialog():
+            if not hasattr(self, 'settings_dialog') or self.settings_dialog is None:
+                self.settings_dialog = SettingsDialog(self, self)
+                # Connect signal for settings updates
+                self.settings_dialog.settings_applied.connect(self.apply_settings)
+                self.settings_dialog.show()
+            else:
+                # Ensure existing dialog is visible and bring to front
+                try:
+                    self.settings_dialog.show()
+                    self.settings_dialog.raise_()
+                    self.settings_dialog.activateWindow()
+                except Exception:
+                    # If the existing instance is invalid, recreate it
+                    self.settings_dialog = SettingsDialog(self, self)
+                    self.settings_dialog.settings_applied.connect(self.apply_settings)
+                    self.settings_dialog.show()
+        QTimer.singleShot(0, show_dialog)
     
     def apply_settings(self, settings):
         """Apply settings from the dialog
@@ -2228,6 +2389,15 @@ class VisualizerCanvas(QWidget):
         
         width = self.width()
         height = self.height()
+        # Debug: announce paint events when debug mode is enabled
+        if hasattr(self, 'parent_visualizer') and getattr(self.parent_visualizer, 'DEBUG', False):
+            if not hasattr(self, '_paint_count'):
+                self._paint_count = 0
+            self._paint_count += 1
+            try:
+                print(f"[PAINT] paint #{self._paint_count} size={width}x{height} fft_len={len(self.fft_data)}")
+            except Exception:
+                pass
         
         # Check if dimensions changed
         dimensions_changed = (width, height) != self.last_dimensions
@@ -2392,6 +2562,9 @@ class VisualizerCanvas(QWidget):
                 # Ensure color LUT is built
                 self._build_color_lut()
                 
+                # Ensure peak_hold matches the number of bars/data points before updating peaks
+                if self.peak_hold.shape[0] != brightness_interpolated.shape[0]:
+                    self.peak_hold = np.zeros(brightness_interpolated.shape[0])
                 # Update peaks: keep max of current brightness and decayed peak
                 self.peak_hold = np.maximum(brightness_interpolated, 
                                             np.maximum(0, self.peak_hold - self.peak_fall_rate))
@@ -2415,88 +2588,74 @@ class VisualizerCanvas(QWidget):
                 
                 if use_vertical:
                     # Vertical layout - bars linearly spaced, representing logarithmic frequencies
-                    bar_height = graph_height / num_bars
+                    bar_height = graph_height / num_freqs
                     bar_h = max(1, int(bar_height) + 1)
-                    
                     # Pre-compute y positions for all bars
                     y_positions = margin_top + (np.arange(num_freqs) * bar_height).astype(np.int32)
                     bar_widths = (brightness_interpolated[num_freqs-1::-1] * graph_width + 0.5).astype(np.int32)
                     peak_xs = (self.peak_hold[num_freqs-1::-1] * graph_width + 0.5).astype(np.int32) + margin_left
-                    
                     # BATCHED DRAWING: Group bars by color for fewer setBrush calls
                     color_groups = {}  # color_key -> list of (y_pos, width, idx, peak_x)
-                    
                     for i in range(num_freqs):
                         idx = num_freqs - 1 - i
-                        
                         # Skip if both bar and peak are negligible
+                        if idx >= brightness_interpolated.shape[0] or i >= self.peak_hold.shape[0]:
+                            continue
                         if brightness_interpolated[idx] < 0.01 and self.peak_hold[i] < 0.01:
                             continue
-                        
                         y_pos = y_positions[i]
                         bar_width_val = bar_widths[i]
                         peak_x = peak_xs[i] if self.peak_hold[i] > 0.001 else None
-                        
                         if bar_width_val > 0 or peak_x is not None:
                             # Use color indices as key for grouping
                             color_key = (brightness_indices[idx], balance_indices[idx])
                             if color_key not in color_groups:
                                 color_groups[color_key] = []
                             color_groups[color_key].append((y_pos, bar_width_val, peak_x))
-                    
                     # Draw all bars grouped by color (reduces setBrush calls from 500+ to ~20-30)
                     for color_key, bars in color_groups.items():
                         color = self._color_lut[color_key[0]][color_key[1]]
                         painter.setBrush(color)
-                        
                         for y_pos, bar_width_val, peak_x in bars:
                             if bar_width_val > 0:
                                 painter.drawRect(margin_left, y_pos, bar_width_val, bar_h)
-                            
                             if peak_x is not None:
                                 painter.setPen(QPen(color, 1))
                                 painter.drawLine(peak_x, y_pos, peak_x, y_pos + bar_h)
                                 painter.setPen(Qt.NoPen)
-
                 else:
                     # Horizontal layout - bars linearly spaced, representing logarithmic frequencies
-                    bar_width = graph_width / num_bars
+                    bar_width = graph_width / num_freqs
                     bar_w = max(1, int(bar_width) + 1)
-                    
                     # Pre-compute x positions for all bars
                     x_positions = margin_left + (np.arange(num_freqs) * bar_width).astype(np.int32)
                     bar_heights = (brightness_interpolated * graph_height + 0.5).astype(np.int32)
                     peak_heights = (self.peak_hold * graph_height + 0.5).astype(np.int32)
-                    
                     # BATCHED DRAWING: Group bars by color for fewer setBrush calls
                     color_groups = {}  # color_key -> list of (x_pos, height, peak_h)
-                    
                     for i in range(num_freqs):
+                        if i >= brightness_interpolated.shape[0] or i >= self.peak_hold.shape[0]:
+                            continue
                         # Skip if both bar and peak are negligible
                         if brightness_interpolated[i] < 0.01 and self.peak_hold[i] < 0.01:
                             continue
-                        
                         x_pos = x_positions[i]
                         bar_height_val = bar_heights[i]
                         peak_h = peak_heights[i] if self.peak_hold[i] > 0.001 else None
-                        
                         if bar_height_val > 0 or peak_h is not None:
                             # Use color indices as key for grouping
                             color_key = (brightness_indices[i], balance_indices[i])
                             if color_key not in color_groups:
                                 color_groups[color_key] = []
                             color_groups[color_key].append((x_pos, bar_height_val, peak_h))
-                    
                     # Draw all bars grouped by color (reduces setBrush calls from 500+ to ~20-30)
                     for color_key, bars in color_groups.items():
                         color = self._color_lut[color_key[0]][color_key[1]]
                         painter.setBrush(color)
-                        
                         for x_pos, bar_height_val, peak_h in bars:
                             if bar_height_val > 0:
                                 y_pos = margin_top + (graph_height - bar_height_val)
                                 painter.drawRect(x_pos, y_pos, bar_w, bar_height_val)
-                            
                             if peak_h is not None:
                                 peak_y = margin_top + (graph_height - peak_h)
                                 painter.setPen(QPen(color, 1))
@@ -2877,7 +3036,6 @@ class SettingsDialog(QDialog):
         
         # Add "Default" option
         devices.insert(0, ("Default", "default"))
-        
         # Populate combo box
         for name, device_id in devices:
             self.device_combo.addItem(name, device_id)
@@ -3024,6 +3182,9 @@ Examples:
 
     parser.add_argument('--device-name', type=str, default=None,
                         help='Force capture from an output device matching this name (substring match).')
+
+    parser.add_argument('--diagnose-audio', action='store_true',
+                        help='Run a short audio capture diagnostic and write logs to /tmp/aVis_diagnostics.log then exit.')
     
     args = parser.parse_args()
     
@@ -3064,6 +3225,10 @@ Examples:
         device_name=args.device_name
     )
     visualizer.show()
+    # If user requested diagnostics, run and exit before entering Qt event loop
+    if args.diagnose_audio:
+        # Run 8 seconds of diagnostics to give time for stereo capture
+        visualizer.run_audio_diagnostics(duration=8, out_file='/tmp/aVis_diagnostics.log')
     sys.exit(app.exec_())
 
 

@@ -1852,9 +1852,10 @@ class VisualizerCanvas(QWidget):
         painter.setRenderHint(QPainter.TextAntialiasing, False)  # Disable text AA too
         painter.setRenderHint(QPainter.SmoothPixmapTransform, False)  # Disable smooth transforms
         
-        # Background - always paint this first
-        bg_color = QColor(20, 20, 30)
-        painter.fillRect(self.rect(), bg_color)
+        # Background - paint only when not using transparent overlay
+        if not getattr(self, "transparent_background", False):
+            bg_color = QColor(20, 20, 30)
+            painter.fillRect(self.rect(), bg_color)
         
         width = self.width()
         height = self.height()
@@ -2139,7 +2140,8 @@ class VisualizerCanvas(QWidget):
             scope_width = width - 20
             
             # Background for oscilloscope
-            painter.fillRect(scope_left, scope_top, scope_width, scope_height, QColor(15, 15, 25))
+            if not getattr(self, "transparent_background", False):
+                painter.fillRect(scope_left, scope_top, scope_width, scope_height, QColor(15, 15, 25))
             
             # Set clipping to prevent overdraw
             painter.setClipRect(scope_left, scope_top, scope_width, scope_height)
